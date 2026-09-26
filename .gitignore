@@ -1,0 +1,13 @@
+.venv/
+dataset/
+models/
+cache/
+logs/
+output/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+*.zip
+student_resource/
+CLAUDE.md
