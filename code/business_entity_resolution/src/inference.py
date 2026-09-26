@@ -9,7 +9,7 @@ import numpy as np
 import normalization as norm
 from features import extract_features_for_pair, FEATURE_NAMES
 from model import EntityMatcherModel
-from blocking import get_blocking_keys, build_inverted_index_for_country, retrieve_candidates_for_s1
+from blocking import get_blocking_keys, prune_index, rank_candidates
 from thresholding import apply_threshold_and_deduplication
 from output import write_submission_tsv, write_final_report
 
@@ -105,12 +105,7 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
             for k in tkeys:
                 index[k].append(tid)
 
-        pruned = 0
-        for k in list(index.keys()):
-            limit = 300 if (k[0].startswith('n') or k[0].startswith('core') or k[0].startswith('compact')) else 150
-            if len(index[k]) > limit:
-                del index[k]
-                pruned += 1
+        pruned = prune_index(index)
 
         print(f'  Inverted index built with {len(index):,} active keys (pruned {pruned:,} keys).')
 
@@ -127,13 +122,9 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
             batch_pairs = []
             for eid, rname, raddr in batch:
                 skeys = get_blocking_keys(rname, raddr, country)
-                counts = collections.Counter()
-                for k in skeys:
-                    if k in index:
-                        counts.update(index[k])
+                cands = rank_candidates(skeys, index, len(targets), top_k)
 
-                if counts:
-                    cands = counts.most_common(top_k)
+                if cands:
                     cand_ids = [tid for tid, _ in cands]
                     all_candidate_results[eid] = cand_ids
 

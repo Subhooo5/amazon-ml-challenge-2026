@@ -45,6 +45,8 @@ DOMAIN_RE = re.compile(r'\.(com|org|net|in|co|io|fr)\b')
 URL_RE = re.compile(r'https?://(?:www\.)?')
 MULTI_SPACE_RE = re.compile(r'\s+')
 NUMBER_RE = re.compile(r'\b\d+\b')
+ORDINAL_RE = re.compile(r'(\d+)(st|nd|rd|th)\b')
+DIGIT_SPLIT_RE = re.compile(r'(?<=[a-z])(?=\d)|(?<=\d)(?=[a-z])')
 
 
 def clean_string(s):
@@ -54,6 +56,8 @@ def clean_string(s):
     s = s.lower()
     s = URL_RE.sub('', s)
     s = DOMAIN_RE.sub(' ', s)
+    s = ORDINAL_RE.sub(r'\1', s)
+    s = DIGIT_SPLIT_RE.sub(' ', s)
     s = PUNCT_RE.sub(' ', s)
     s = MULTI_SPACE_RE.sub(' ', s).strip()
     return s

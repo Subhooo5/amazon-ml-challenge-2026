@@ -1,5 +1,12 @@
 import collections
+import heapq
+import math
 import normalization as norm
+
+TOP_K = 25
+SINGLE_CAP = 300
+COMBO_CAP = 1000
+NAME_KEYS = {'compact_n', 'compact_sort_n', 'core_n', 'n2', 'sort_n', 'n1', 'n_tok'}
 
 COMMON_ADDR_WORDS = {
     'street', 'road', 'avenue', 'boulevard', 'drive', 'court', 'lane', 'place',
@@ -10,6 +17,8 @@ COMMON_ADDR_WORDS = {
     'bazaar', 'marg', 'gali', 'null', 'rd', 'st', 'ave', 'blvd', 'dr', 'ct', 'ln',
     'hwy', 'apt', 'ste', 'first', 'second', 'third', 'ground'
 }
+
+STATE_WORDS = set(' '.join(norm.STATE_MAP.values()).split())
 
 
 def get_blocking_keys(name, addr, country):
@@ -38,61 +47,33 @@ def get_blocking_keys(name, addr, country):
         if len(t) >= 4:
             keys.add(('n_tok', t))
 
-    sig_addr_words = [t for t in a_tokens if t not in COMMON_ADDR_WORDS and len(t) >= 3 and not t.isdigit()]
+    places = sorted({t for t in a_tokens if t.isalpha() and len(t) >= 3 and t not in COMMON_ADDR_WORDS and t not in STATE_WORDS})
+    nums = sorted(nums)[:3]
+    nt = [t for t in n_tokens if len(t) >= 3][:2]
 
-    if nums and len(a_tokens) >= 1:
-        for num in nums:
-            if len(num) >= 1:
-                keys.add(('num_city1', f'{num}_{a_tokens[-1]}'))
-                if len(a_tokens) >= 2:
-                    keys.add(('num_city2', f'{num}_{a_tokens[-2]}'))
-
-    if nums and sig_addr_words:
-        for num in nums:
-            for w in sig_addr_words[:3]:
-                keys.add(('num_street', f'{num}_{w}'))
-
-    if n_tokens and nums:
-        for num in nums:
-            keys.add(('name_num', f'{n_tokens[0]}_{num}'))
-            if len(n_tokens) >= 2:
-                keys.add(('name_num2', f'{n_tokens[1]}_{num}'))
-
-    if n_tokens and len(a_tokens) >= 1:
-        keys.add(('name_city', f'{n_tokens[0]}_{a_tokens[-1]}'))
-        if len(a_tokens) >= 2:
-            keys.add(('name_city2', f'{n_tokens[0]}_{a_tokens[-2]}'))
-
-    if len(sig_addr_words) >= 2:
-        for i in range(min(len(sig_addr_words), 4)):
-            for j in range(i + 1, min(len(sig_addr_words), 4)):
-                w1, w2 = sorted([sig_addr_words[i], sig_addr_words[j]])
-                keys.add(('addr_pair', f'{w1}_{w2}'))
+    keys.update(('np', t, p) for t in nt for p in places[:8])
+    keys.update(('nump', n, p) for n in nums for p in places[:4])
+    keys.update(('addr_pair', a, b) for i, a in enumerate(places[:4]) for b in places[i + 1:4])
+    keys.update(('name_num', t, n) for t in nt for n in nums)
 
     return keys
 
 
-def build_inverted_index_for_country(target_records, name_prune=300, addr_prune=150):
-    index = collections.defaultdict(list)
-    for tid, (rname, raddr, rcountry) in target_records.items():
-        keys = get_blocking_keys(rname, raddr, rcountry)
-        for k in keys:
-            index[k].append(tid)
-
-    for k in list(index.keys()):
-        limit = name_prune if (k[0].startswith('n') or k[0].startswith('core') or k[0].startswith('compact')) else addr_prune
-        if len(index[k]) > limit:
-            del index[k]
-
-    return index
+def prune_index(index):
+    pruned = [k for k, postings in index.items() if len(postings) > (SINGLE_CAP if k[0] in NAME_KEYS else COMBO_CAP)]
+    for k in pruned:
+        del index[k]
+    return len(pruned)
 
 
-def retrieve_candidates_for_s1(rname, raddr, rcountry, inverted_index, top_k=20):
-    s_keys = get_blocking_keys(rname, raddr, rcountry)
-    counts = collections.Counter()
-    for k in s_keys:
-        if k in inverted_index:
-            counts.update(inverted_index[k])
-    if counts:
-        return counts.most_common(top_k)
-    return []
+def rank_candidates(keys, index, n_targets, top_k=TOP_K):
+    score = collections.defaultdict(float)
+    count = collections.Counter()
+    for k in sorted(keys):
+        postings = index.get(k)
+        if postings:
+            w = math.log(1 + n_targets / len(postings))
+            for tid in postings:
+                score[tid] += w
+                count[tid] += 1
+    return [(tid, count[tid]) for tid in heapq.nsmallest(top_k, score, key=lambda t: (-score[t], t))]
