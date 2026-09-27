@@ -10,12 +10,12 @@ import numpy as np
 import normalization as norm
 from features import extract_features_for_pair, add_context, FEATURE_NAMES
 from model import EntityMatcherModel
-from blocking import get_blocking_keys, prune_index, rank_candidates
+from blocking import get_blocking_keys, prune_index, rank_candidates, TOP_K, NAME_K
 from thresholding import apply_gate_addon
 from output import write_submission_tsv, write_final_report
 
 
-def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5000, top_k=15):
+def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5000, top_k=TOP_K):
     t_start = time.time()
     os.makedirs(output_dir, exist_ok=True)
 
@@ -31,6 +31,8 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
 
     if meta.get('feature_names') != FEATURE_NAMES or model.model.n_features_in_ != len(FEATURE_NAMES):
         sys.exit(f'Model/feature mismatch: model has {model.model.n_features_in_} features, metadata lists {len(meta.get("feature_names") or [])}, code expects {len(FEATURE_NAMES)}. Retrain with train.py.')
+    if meta.get('top_k') != top_k or meta.get('name_k') != NAME_K:
+        sys.exit(f'Blocking mismatch: model trained with top_k={meta.get("top_k")}, name_k={meta.get("name_k")}; inference uses top_k={top_k}, name_k={NAME_K}. Retrain with train.py.')
     gate = meta['gate_threshold']
     addon = meta['addon_threshold']
     params = model.model.get_params()
@@ -115,7 +117,8 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
         idf = collections.defaultdict(lambda: log_n, {t: log_n - math.log(1 + c) for t, c in df.items()})
         del df
 
-        print(f'  Inverted index built with {len(index):,} active keys (pruned {pruned:,} keys).')
+        t_index = time.time() - c_t0
+        print(f'  Inverted index built with {len(index):,} active keys (pruned {len(pruned):,} keys); target load+normalize+index {t_index:.1f}s.')
 
         print(f'  Scoring candidates for {len(s1_list):,} S1 records in batches of {batch_size}...')
         
@@ -129,7 +132,7 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
 
             batch_pairs = []
             for eid, rname, raddr in batch:
-                skeys = get_blocking_keys(rname, raddr, country)
+                skeys = get_blocking_keys(rname, raddr, country, query=True)
                 cands = rank_candidates(skeys, index, len(targets), top_k)
 
                 if cands:
@@ -160,9 +163,9 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
         for eid, mids in c_matches.items():
             all_matched_results[eid] = mids
 
-        del targets, target_preprocessed, index, idf, c_scores_dict, c_matches
+        del targets, target_preprocessed, index, idf, pruned, c_scores_dict, c_matches
         gc.collect()
-        print(f'  Country {country} completed in {time.time()-c_t0:.1f}s.')
+        print(f'  Country {country} completed in {time.time()-c_t0:.1f}s (S1 query+features+predict {time.time()-c_t0-t_index:.1f}s).')
 
     print('\n[4/5] Writing output files in exact test Source 1 order...')
     matching_path = os.path.join(output_dir, 'matching_results.tsv')

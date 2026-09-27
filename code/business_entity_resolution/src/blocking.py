@@ -23,7 +23,7 @@ COMMON_ADDR_WORDS = {
 STATE_WORDS = set(' '.join([*norm.US_STATES.values(), *norm.IN_STATES.values()]).split())
 
 
-def get_blocking_keys(name, addr, country):
+def get_blocking_keys(name, addr, country, query=False):
     c_n, core_n, sort_n, skel = norm.normalize_name(name)
     c_a, nums, sort_a = norm.normalize_address(addr, country)
 
@@ -57,27 +57,29 @@ def get_blocking_keys(name, addr, country):
         keys.add(('sk', ' '.join(sorted(skels))))
 
     places = sorted({t for t in a_tokens if t.isalpha() and len(t) >= 3 and t not in COMMON_ADDR_WORDS})
-    sp = ([p for p in places if p not in STATE_WORDS] or places)[:4]
-    nums = sorted(nums)[:3]
+    sp = [p for p in places if p not in STATE_WORDS] or places
+    nums = sorted(nums)
+    if not query:
+        places, sp, nums = places[:8], sp[:4], nums[:3]
     nt = [t for t in n_tokens if len(t) >= 3][:2]
 
-    keys.update(('np', t, p) for t in nt for p in places[:8])
-    keys.update(('skp', k, p) for k in [k for k in skels if len(k) >= 2][:2] for p in places[:8])
+    keys.update(('np', t, p) for t in nt for p in places)
+    keys.update(('skp', k, p) for k in [k for k in skels if len(k) >= 2][:2] for p in places)
     keys.update(('nump', n, p) for n in nums for p in sp)
-    keys.update(('addr_pair', a, b) for i, a in enumerate(sp) for b in sp[i + 1:])
+    keys.update(('addr_pair', a, b) for i, a in enumerate(sp[:12]) for b in sp[i + 1:12])
     keys.update(('name_num', t, n) for t in nt for n in nums)
 
     return keys
 
 
 def prune_index(index):
-    pruned = [k for k, postings in index.items() if len(postings) > (SINGLE_CAP if k[0] in NAME_KEYS else COMBO_CAP)]
+    pruned = {k for k, postings in index.items() if len(postings) > (SINGLE_CAP if k[0] in NAME_KEYS else COMBO_CAP)}
     for k in pruned:
         del index[k]
-    return len(pruned)
+    return pruned
 
 
-def rank_candidates(keys, index, n_targets, top_k=TOP_K):
+def rank_candidates(keys, index, n_targets, top_k=TOP_K, name_k=NAME_K):
     score = collections.defaultdict(float)
     name_score = collections.defaultdict(float)
     count = collections.Counter()
@@ -91,6 +93,6 @@ def rank_candidates(keys, index, n_targets, top_k=TOP_K):
             if k[0] in NAME_KEYS:
                 for tid in postings:
                     name_score[tid] += w
-    picked = set(heapq.nsmallest(min(NAME_K, top_k), name_score, key=lambda t: (-name_score[t], t)))
+    picked = set(heapq.nsmallest(min(name_k, top_k), name_score, key=lambda t: (-name_score[t], t)))
     picked.update(heapq.nsmallest(top_k - len(picked), (t for t in score if t not in picked), key=lambda t: (-score[t], t)))
     return [(tid, count[tid]) for tid in sorted(picked, key=lambda t: (-score[t], t))]

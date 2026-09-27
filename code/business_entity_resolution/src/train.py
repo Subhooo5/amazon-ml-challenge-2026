@@ -18,7 +18,7 @@ from features import extract_features_for_pair, add_context, FEATURE_NAMES
 from model import EntityMatcherModel
 from evaluation import evaluate_predictions
 from thresholding import optimize_source_specific_thresholds, apply_threshold_and_deduplication, optimize_gate_addon, apply_gate_addon
-from blocking import get_blocking_keys, prune_index, rank_candidates, TOP_K
+from blocking import get_blocking_keys, prune_index, rank_candidates, TOP_K, NAME_K
 
 
 def auto_detect_train_dir():
@@ -35,7 +35,7 @@ def main():
                         help='Path to train dataset directory containing train_source1/2/3.tsv and train_ground_truth.tsv')
     parser.add_argument('--val-ids', default='experiments/val_s1_ids.txt',
                         help='Path to file containing held-out validation Source 1 IDs')
-    parser.add_argument('--n-train', type=int, default=100000,
+    parser.add_argument('--n-train', type=int, default=200000,
                         help='Number of training Source 1 entities to sample')
     parser.add_argument('--pool-limit', type=int, default=0,
                         help='Per source file, keep all true targets plus the first N other targets of the country (0 = full pool)')
@@ -106,7 +106,7 @@ def main():
         cn, core_n, _, skel = norm.normalize_name(rname)
         ca, nums, _ = norm.normalize_address(raddr, rcountry)
         s1_preprocessed[sid] = (cn, core_n, ca, nums, skel, rcountry)
-        s1_blocking_keys[sid] = get_blocking_keys(rname, raddr, rcountry)
+        s1_blocking_keys[sid] = get_blocking_keys(rname, raddr, rcountry, query=True)
 
     needed_targets = collections.defaultdict(set)
     for gt in (train_gt, val_gt):
@@ -121,6 +121,9 @@ def main():
     y_es = []
     val_pair_list = []
     val_ranks = []
+    val_ranks60 = []
+    no_name_k_hits = 0
+    miss_cat = collections.Counter()
     missed_examples = []
     missed_empty_addr = 0
     missed_non_ascii = 0
@@ -155,6 +158,7 @@ def main():
         df = collections.Counter(t for v in target_preprocessed.values() for t in set(v[1].split()))
         idf = collections.defaultdict(lambda: log_n, {t: log_n - math.log(1 + c) for t, c in df.items()})
         del df
+        t_index = time.time() - c_t0
 
         for sid in [sid for sid in train_s1_ids if s1_preprocessed[sid][5] == country]:
             cands = rank_candidates(s1_blocking_keys[sid], index, len(targets), TOP_K)
@@ -165,22 +169,29 @@ def main():
             y_part.extend(int(tid in train_gt[sid]) for tid, _ in cands)
 
         for sid in [sid for sid in val_s1_ids if s1_preprocessed[sid][5] == country]:
-            cands = rank_candidates(s1_blocking_keys[sid], index, len(targets), TOP_K)
+            skeys = s1_blocking_keys[sid]
+            cands = rank_candidates(skeys, index, len(targets), TOP_K)
             rank_of = {tid: r for r, (tid, _) in enumerate(cands)}
+            rank60 = {tid: r for r, (tid, _) in enumerate(rank_candidates(skeys, index, len(targets), 60))}
+            no_name_k = {tid for tid, _ in rank_candidates(skeys, index, len(targets), TOP_K, 0)}
             s1_tup = s1_preprocessed[sid][:5]
             rows = add_context([extract_features_for_pair(s1_tup, target_preprocessed[tid], tid, sh, idf) for tid, sh in cands])
             val_pair_list.extend((sid, tid, feats) for (tid, _), feats in zip(cands, rows))
             for mid in sorted(val_gt[sid]):
                 val_ranks.append(rank_of.get(mid))
+                val_ranks60.append(rank60.get(mid))
+                no_name_k_hits += mid in no_name_k
                 if mid not in rank_of:
                     t_name, t_addr = targets.get(mid, ('', ''))
+                    shared = skeys & get_blocking_keys(t_name, t_addr, country)
+                    miss_cat['no_shared_key' if not shared else 'only_pruned' if shared <= pruned else 'ranked_out'] += 1
                     missed_empty_addr += not norm.clean_string(t_addr)
                     missed_non_ascii += not t_name.isascii()
                     if len(missed_examples) < 20:
                         missed_examples.append(f'{sid} {s1_raw[sid][0]} | {s1_raw[sid][1]}  <->  {mid} {t_name} | {t_addr}')
 
-        print(f'  {country}: {len(targets):,} targets, {pruned:,} keys pruned, {time.time() - c_t0:.1f}s')
-        del targets, target_preprocessed, index, idf
+        print(f'  {country}: {len(targets):,} targets, {len(pruned):,} keys pruned, target load+normalize+index {t_index:.1f}s, S1 query+features {time.time() - c_t0 - t_index:.1f}s')
+        del targets, target_preprocessed, index, idf, pruned
         gc.collect()
 
     X_train = np.array(X_train, dtype=np.float32)
@@ -244,8 +255,10 @@ def main():
     print(f"False Negatives   : {metrics['total_fn']}")
     print(f"Predicted Links   : {metrics['total_pred_links']}")
     print(f"Singleton Accuracy: {metrics['singleton_accuracy']:.6f}")
-    for k in (10, 15, 20, 25):
-        print(f"Candidate Recall@{k}: {sum(r is not None and r < k for r in val_ranks) / max(total_val_true, 1):.6f}")
+    for k in (10, 15, 20, 25, 40, 60):
+        print(f"Top-60 Recall@{k:<3}: {sum(r is not None and r < k for r in val_ranks60) / max(total_val_true, 1):.6f}")
+    print(f"name_k=0 Recall@25: {no_name_k_hits / max(total_val_true, 1):.6f}")
+    print(f"Missed at TOP_K   : no_shared_key {miss_cat['no_shared_key']:,}, only_pruned {miss_cat['only_pruned']:,}, ranked_out {miss_cat['ranked_out']:,}")
     print('=' * 60 + '\n')
     print(f'Missed validation links (first {len(missed_examples)}):')
     for ex in missed_examples:
@@ -275,6 +288,7 @@ def main():
         'total_pred_links': int(metrics['total_pred_links']),
         'singleton_accuracy': float(metrics['singleton_accuracy']),
         'top_k': TOP_K,
+        'name_k': NAME_K,
         'n_train': len(train_s1_ids),
         'n_val': len(val_s1_ids),
         'pool_limit': args.pool_limit,
