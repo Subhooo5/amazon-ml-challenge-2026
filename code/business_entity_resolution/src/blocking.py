@@ -5,9 +5,9 @@ import normalization as norm
 
 TOP_K = 25
 NAME_K = 8
-SINGLE_CAP = 300
-COMBO_CAP = 1000
-NAME_KEYS = {'compact_n', 'compact_sort_n', 'core_n', 'n2', 'sort_n', 'n1', 'n_tok', 'sk', 'compact_strict'}
+SINGLE_CAP = 500
+COMBO_CAP = 2000
+NAME_KEYS = {'compact_n', 'compact_sort_n', 'core_n', 'n2', 'sort_n', 'n1', 'n_tok', 'sk', 'compact_strict', 'skn'}
 
 COMMON_ADDR_WORDS = {
     'street', 'road', 'avenue', 'boulevard', 'drive', 'court', 'lane', 'place',
@@ -20,7 +20,15 @@ COMMON_ADDR_WORDS = {
     'sur', 'chemin', 'allee', 'impasse', 'route', 'quai', 'saint', 'sainte', 'bis', 'ter'
 }
 
-STATE_WORDS = set(' '.join([*norm.US_STATES.values(), *norm.IN_STATES.values()]).split())
+STATE_WORDS = {
+    'US': set(' '.join(norm.US_STATES.values()).split()),
+    'India': set(' '.join(norm.IN_STATES.values()).split()),
+    'France': {
+        'hauts', 'france', 'nouvelle', 'aquitaine', 'pays', 'loire', 'ile', 'occitanie', 'bretagne', 'normandie',
+        'grand', 'est', 'auvergne', 'rhone', 'alpes', 'provence', 'cote', 'azur', 'bourgogne', 'franche', 'comte',
+        'centre', 'val', 'corse'
+    }
+}
 
 
 def get_blocking_keys(name, addr, country, query=False):
@@ -55,16 +63,19 @@ def get_blocking_keys(name, addr, country, query=False):
     skels = skel.split()
     if skels:
         keys.add(('sk', ' '.join(sorted(skels))))
+    sk2 = [k for k in skels if len(k) >= 2][:2]
+    if sk2:
+        keys.add(('skn', ' '.join(sorted(k[:3] for k in sk2))))
 
     places = sorted({t for t in a_tokens if t.isalpha() and len(t) >= 3 and t not in COMMON_ADDR_WORDS})
-    sp = [p for p in places if p not in STATE_WORDS] or places
+    sp = [p for p in places if p not in STATE_WORDS.get(country, set())] or places
     nums = sorted(nums)
     if not query:
         places, sp, nums = places[:8], sp[:4], nums[:3]
     nt = [t for t in n_tokens if len(t) >= 3][:2]
 
     keys.update(('np', t, p) for t in nt for p in places)
-    keys.update(('skp', k, p) for k in [k for k in skels if len(k) >= 2][:2] for p in places)
+    keys.update(('skp', k, p) for k in sk2 for p in places)
     keys.update(('nump', n, p) for n in nums for p in sp)
     keys.update(('addr_pair', a, b) for i, a in enumerate(sp[:12]) for b in sp[i + 1:12])
     keys.update(('name_num', t, n) for t in nt for n in nums)

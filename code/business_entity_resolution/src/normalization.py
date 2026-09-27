@@ -17,10 +17,8 @@ DESCRIPTORS = {
 
 SKEL_RULES = [
     ('tion', 'shn'), ('ph', 'f'), ('bh', 'b'), ('dh', 'd'), ('th', 't'), ('kh', 'k'), ('gh', 'g'),
-    ('sh', 's'), ('ch', 'c'), ('ck', 'k'), ('c', 'k'), ('q', 'k'), ('z', 'j'), ('w', 'v')
+    ('sh', 's'), ('ch', 'c'), ('ck', 'k'), ('c', 'k'), ('q', 'k'), ('z', 'j'), ('w', 'v'), ('g', 'j')
 ]
-
-SKEL_LEGAL = {'pr', 'l', 'prvt', 'pvt', 'lmtd', 'ltd', 'lld', 'llp', 'llc', 'ink', 'inkrprtd', 'krp', 'kmpn', 'k'}
 
 ADDR_ABBR = {
     'rd': 'road', 'st': 'street', 'ave': 'avenue', 'blvd': 'boulevard',
@@ -64,6 +62,9 @@ NUMBER_RE = re.compile(r'\b\d+\b')
 ORDINAL_RE = re.compile(r'(\d+)(st|nd|rd|th)\b')
 DIGIT_SPLIT_RE = re.compile(r'(?<=[a-z])(?=\d)|(?<=\d)(?=[a-z])')
 REPEAT_RE = re.compile(r'(.)\1+')
+LEAD_VOWEL_RE = re.compile(r'^[aeiouy]')
+SKEL_N_RE = re.compile(r'(?<=.)n(?=[^aeiouyn])')
+NULL_RE = re.compile(r'\bnull\b')
 
 
 def clean_string(s):
@@ -76,6 +77,7 @@ def clean_string(s):
     s = ORDINAL_RE.sub(r'\1', s)
     s = DIGIT_SPLIT_RE.sub(' ', s)
     s = PUNCT_RE.sub(' ', s)
+    s = NULL_RE.sub(' ', s)
     s = MULTI_SPACE_RE.sub(' ', s).strip()
     return s
 
@@ -83,8 +85,15 @@ def clean_string(s):
 def skeleton(token):
     for a, b in SKEL_RULES:
         token = token.replace(a, b)
+    token = LEAD_VOWEL_RE.sub('a', token)
     token = token[:1] + ''.join(ch for ch in token[1:] if ch not in 'aeiouy')
-    return REPEAT_RE.sub(r'\1', token)
+    token = REPEAT_RE.sub(r'\1', SKEL_N_RE.sub('', token))
+    while len(token) > 4 and token[-1] in 'sj':
+        token = token[:-1]
+    return token
+
+
+SKEL_LEGAL = {k for k in map(skeleton, LEGAL_SUFFIXES | {'praa', 'li', 'praivett', 'praaivett', 'praiveett', 'limittedd'}) if len(k) >= 3} | {'pr', 'l', 'k'}
 
 
 def normalize_name(name):
@@ -107,15 +116,19 @@ def normalize_address(addr, country=''):
         return '', set(), ''
     abbr = FR_ABBR if country == 'France' else ADDR_ABBR
     states = US_STATES if country == 'US' else IN_STATES if country == 'India' else {}
-    tokens = cleaned.split()
+    chunks = [clean_string(c).split() for c in addr.split(',')] if country == 'US' else [cleaned.split()]
     expanded_tokens = []
-    for t in tokens:
-        if t in abbr:
-            expanded_tokens.append(abbr[t])
-        elif t in states:
-            expanded_tokens.append(states[t])
-        else:
-            expanded_tokens.append(t)
+    for tokens in chunks:
+        state_pos = len(tokens) - 1 if country == 'US' and tokens and tokens[-1] in states and not any(t.isdigit() for t in tokens) else -1
+        for i, t in enumerate(tokens):
+            if i == state_pos:
+                expanded_tokens.append(states[t])
+            elif t in abbr:
+                expanded_tokens.append(abbr[t])
+            elif t in states:
+                expanded_tokens.append(states[t])
+            else:
+                expanded_tokens.append(t)
     expanded_addr = ' '.join(expanded_tokens)
     numbers = {n.lstrip('0') or '0' for n in NUMBER_RE.findall(cleaned)}
     token_sorted = ' '.join(sorted(expanded_tokens))

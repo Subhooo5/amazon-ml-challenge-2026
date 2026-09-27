@@ -123,6 +123,8 @@ def main():
     val_ranks = []
     val_ranks60 = []
     no_name_k_hits = 0
+    name_k12_hits = 0
+    recall_groups = collections.defaultdict(lambda: [0, 0])
     miss_cat = collections.Counter()
     missed_examples = []
     missed_empty_addr = 0
@@ -174,6 +176,7 @@ def main():
             rank_of = {tid: r for r, (tid, _) in enumerate(cands)}
             rank60 = {tid: r for r, (tid, _) in enumerate(rank_candidates(skeys, index, len(targets), 60))}
             no_name_k = {tid for tid, _ in rank_candidates(skeys, index, len(targets), TOP_K, 0)}
+            name_k12 = {tid for tid, _ in rank_candidates(skeys, index, len(targets), TOP_K, 12)}
             s1_tup = s1_preprocessed[sid][:5]
             rows = add_context([extract_features_for_pair(s1_tup, target_preprocessed[tid], tid, sh, idf) for tid, sh in cands])
             val_pair_list.extend((sid, tid, feats) for (tid, _), feats in zip(cands, rows))
@@ -181,8 +184,12 @@ def main():
                 val_ranks.append(rank_of.get(mid))
                 val_ranks60.append(rank60.get(mid))
                 no_name_k_hits += mid in no_name_k
+                name_k12_hits += mid in name_k12
+                t_name, t_addr = targets.get(mid, ('', ''))
+                for g in [country] + ([] if t_name.isascii() else ['non-ASCII']):
+                    recall_groups[g][0] += mid in rank_of
+                    recall_groups[g][1] += 1
                 if mid not in rank_of:
-                    t_name, t_addr = targets.get(mid, ('', ''))
                     shared = skeys & get_blocking_keys(t_name, t_addr, country)
                     miss_cat['no_shared_key' if not shared else 'only_pruned' if shared <= pruned else 'ranked_out'] += 1
                     missed_empty_addr += not norm.clean_string(t_addr)
@@ -257,7 +264,9 @@ def main():
     print(f"Singleton Accuracy: {metrics['singleton_accuracy']:.6f}")
     for k in (10, 15, 20, 25, 40, 60):
         print(f"Top-60 Recall@{k:<3}: {sum(r is not None and r < k for r in val_ranks60) / max(total_val_true, 1):.6f}")
-    print(f"name_k=0 Recall@25: {no_name_k_hits / max(total_val_true, 1):.6f}")
+    print(f"name_k=0 Recall@25: {no_name_k_hits / max(total_val_true, 1):.6f}, name_k=12 Recall@25: {name_k12_hits / max(total_val_true, 1):.6f}")
+    for g, (hits, n) in recall_groups.items():
+        print(f"Recall@25 {g:<9}: {hits / n:.6f} ({hits:,}/{n:,})")
     print(f"Missed at TOP_K   : no_shared_key {miss_cat['no_shared_key']:,}, only_pruned {miss_cat['only_pruned']:,}, ranked_out {miss_cat['ranked_out']:,}")
     print('=' * 60 + '\n')
     print(f'Missed validation links (first {len(missed_examples)}):')
