@@ -1,4 +1,5 @@
 import sys
+import math
 import numpy as np
 from rapidfuzz import fuzz
 from rapidfuzz.distance import Levenshtein, JaroWinkler
@@ -49,6 +50,13 @@ FEATURE_NAMES = [
     'cos_addr',
     'rrf_rank',
     'is_reverse',
+    'blk_score',
+    'name_partial',
+    'compact_ratio',
+    'acronym_match',
+    's1_addr_missing',
+    'num_jaccard',
+    'name_pool_freq',
     'blk_rank',
     'n_cands',
     'gap_name_set',
@@ -57,7 +65,9 @@ FEATURE_NAMES = [
     'gap_cross_prod',
     'gap_skel_set',
     'best_name_set',
-    'best_cross_prod'
+    'best_cross_prod',
+    'blk_score_gap',
+    'gap_cos_name'
 ]
 
 LEGAL_CANON = {
@@ -67,6 +77,8 @@ LEGAL_CANON = {
 
 GAP_COLS = [FEATURE_NAMES.index(n) for n in ('name_token_set', 'name_jw_sim', 'addr_token_set', 'cross_prod', 'skel_token_set')]
 BEST_COLS = [FEATURE_NAMES.index(n) for n in ('name_token_set', 'cross_prod')]
+BLK_COL = FEATURE_NAMES.index('blk_score')
+COS_NAME_COL = FEATURE_NAMES.index('cos_name')
 
 
 def char_ngrams(s, n=3):
@@ -75,7 +87,7 @@ def char_ngrams(s, n=3):
     return {s[i:i+n] for i in range(len(s) - n + 1)}
 
 
-def extract_features_for_pair(s1_tuple, target_tuple, target_id, shared_keys=1, idf=None):
+def extract_features_for_pair(s1_tuple, target_tuple, target_id, shared_keys=1, idf=None, retrieval=(), name_freq=0):
     s1_name, s1_core, s1_addr, s1_nums, s1_skel = s1_tuple
     t_name, t_core, t_addr, t_nums, t_skel = target_tuple
 
@@ -176,6 +188,13 @@ def extract_features_for_pair(s1_tuple, target_tuple, target_id, shared_keys=1, 
         idf_jaccard = 0.0
         max_idf_unshared = 0.0
 
+    s1_compact = s1_core.replace(' ', '')
+    t_compact = t_core.replace(' ', '')
+    partial = fuzz.partial_ratio(s1_core, t_core) / 100.0 if s1_core and t_core else 0.0
+    compact_ratio = Levenshtein.normalized_similarity(s1_compact, t_compact) if s1_compact and t_compact else 0.0
+    acronym = 1.0 if any(len(a) >= 2 and len(b) == 1 and ''.join(w[0] for w in a) == b[0] for a, b in ((s1_toks, t_toks), (t_toks, s1_toks))) else 0.0
+    num_jaccard = len(s1_nums & t_nums) / len(s1_nums | t_nums) if s1_nums and t_nums else 0.0
+
     return [
         exact_clean,
         exact_core,
@@ -216,13 +235,21 @@ def extract_features_for_pair(s1_tuple, target_tuple, target_id, shared_keys=1, 
         desc_conflict,
         idf_jaccard,
         max_idf_unshared
+    ] + list(retrieval) + [
+        partial,
+        compact_ratio,
+        acronym,
+        0.0 if s1_addr else 1.0,
+        num_jaccard,
+        math.log1p(name_freq)
     ]
 
 
 def add_context(rows):
-    best = {c: max((r[c] for r in rows), default=0.0) for c in GAP_COLS}
+    best = {c: max((r[c] for r in rows), default=0.0) for c in GAP_COLS + [BLK_COL, COS_NAME_COL]}
     for rank, r in enumerate(rows):
         r.extend([float(rank), float(len(rows))])
         r.extend(r[c] - best[c] for c in GAP_COLS)
         r.extend(1.0 if r[c] == best[c] else 0.0 for c in BEST_COLS)
+        r.extend([best[BLK_COL] - r[BLK_COL], r[COS_NAME_COL] - best[COS_NAME_COL]])
     return rows

@@ -8,7 +8,7 @@ import normalization as norm
 TOP_K = 25
 NAME_K = 8
 POOL_K = 200
-REV_MAX = 10
+REV_MAX = 5
 RRF_C = 60
 SINGLE_CAP = 500
 COMBO_CAP = 2000
@@ -123,25 +123,26 @@ def build_views(names, skels, addrs):
     return vecs, [v.fit_transform(x).tocsr() for v, x in zip(vecs, (names, skels, addrs))]
 
 
-def rerank(s_idx, t_idx, blk_score, S, T):
+def rerank(s_idx, t_idx, blk_score, S, T, weights=((1, 1, 1, 1),)):
     cos = [np.asarray(Sv[s_idx].multiply(Tv[t_idx]).sum(axis=1), dtype=np.float32).ravel() for Sv, Tv in zip(S, T)]
-    rrf_rank = np.zeros(len(s_idx), np.int16)
+    rrf_rank = np.zeros((len(weights), len(s_idx)), np.int16)
     if len(s_idx):
         pos = np.arange(len(s_idx))
         ss = np.sort(s_idx)
         within = pos - np.maximum.accumulate(np.where(np.r_[True, ss[1:] != ss[:-1]], pos, 0))
-        rrf = np.zeros(len(s_idx))
-        for v in [blk_score] + cos:
-            rrf[np.lexsort((t_idx, -blk_score, -v, s_idx))] += 1.0 / (RRF_C + 1 + within)
-        rrf_rank[np.lexsort((t_idx, -rrf, s_idx))] = within
-    return cos[0], cos[1], cos[2], rrf_rank
+        inv = np.empty((4, len(s_idx)))
+        for j, v in enumerate([blk_score] + cos):
+            inv[j, np.lexsort((t_idx, -blk_score, -v, s_idx))] = 1.0 / (RRF_C + 1 + within)
+        for w, r in zip(weights, rrf_rank):
+            r[np.lexsort((t_idx, -(np.asarray(w, dtype=float) @ inv), s_idx))] = within
+    return cos[0], cos[1], cos[2], np.maximum(cos[0], cos[1]) + cos[2], rrf_rank
 
 
-def reverse_add(s_idx, t_idx, cos_name, cos_skel, cos_addr, rrf_rank):
+def reverse_add(s_idx, t_idx, sim, rrf_rank, min_sim=0.0):
     rev_rank = np.full(len(s_idx), -1, np.int16)
-    if len(s_idx):
-        sim = np.maximum(cos_name, cos_skel) + cos_addr
-        order = np.lexsort((s_idx, -sim, t_idx))
+    live = np.flatnonzero((rrf_rank < TOP_K) | (sim >= min_sim))
+    if len(live):
+        order = live[np.lexsort((s_idx[live], -sim[live], t_idx[live]))]
         best = order[np.r_[True, t_idx[order][1:] != t_idx[order][:-1]]]
         add = best[rrf_rank[best] >= TOP_K]
         add = add[np.lexsort((t_idx[add], -sim[add], s_idx[add]))]

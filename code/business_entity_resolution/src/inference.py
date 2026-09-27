@@ -6,6 +6,7 @@ import gc
 import math
 import resource
 import collections
+import joblib
 import numpy as np
 from array import array
 
@@ -13,7 +14,7 @@ import normalization as norm
 from features import extract_features_for_pair, add_context, FEATURE_NAMES
 from model import EntityMatcherModel
 from blocking import get_blocking_keys, prune_index, rank_candidates, build_views, rerank, reverse_add, TOP_K, NAME_K, POOL_K, REV_MAX
-from thresholding import apply_gate_addon
+from thresholding import apply_threshold_and_deduplication, apply_gate_addon, expected_f05_select
 from output import write_submission_tsv, write_final_report
 
 
@@ -35,10 +36,16 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
         sys.exit(f'Model/feature mismatch: model has {model.model.n_features_in_} features, metadata lists {len(meta.get("feature_names") or [])}, code expects {len(FEATURE_NAMES)}. Retrain with train.py.')
     if [meta.get(k) for k in ('top_k', 'name_k', 'pool_k', 'rev_max')] != [top_k, NAME_K, POOL_K, REV_MAX]:
         sys.exit(f'Blocking mismatch: model trained with top_k={meta.get("top_k")}, name_k={meta.get("name_k")}, pool_k={meta.get("pool_k")}, rev_max={meta.get("rev_max")}; inference uses top_k={top_k}, name_k={NAME_K}, pool_k={POOL_K}, rev_max={REV_MAX}. Retrain with train.py.')
-    gate = meta['gate_threshold']
-    addon = meta['addon_threshold']
+    rule = meta.get('decision_rule')
+    rule_params = meta.get('decision_params') or {}
+    rrf_weights = meta.get('rrf_weights')
+    min_rev_sim = meta.get('min_rev_sim')
+    calibrator_path = meta.get('calibrator_path') or ''
+    if {'per_source': {'s2', 's3'}, 'gate_addon': {'gate', 'addon'}, 'expected_f05': {'floor'}}.get(rule) != set(rule_params) or rrf_weights is None or len(rrf_weights) != 4 or min_rev_sim is None or not os.path.isfile(calibrator_path):
+        sys.exit(f'Metadata mismatch: decision_rule={rule} {rule_params}, rrf_weights={rrf_weights}, min_rev_sim={min_rev_sim}, calibrator_path={calibrator_path!r}. Retrain with train.py.')
+    calibrator = joblib.load(calibrator_path)
     params = model.model.get_params()
-    print(f'Using decision rule: gate = {gate:.2f}, addon = {addon:.2f}')
+    print(f'Using RRF weights {rrf_weights}, MIN_REV_SIM {min_rev_sim:.2f}, REV_MAX {REV_MAX}, decision rule {rule} {rule_params} on calibrated probabilities')
 
     s1_path = os.path.join(test_dir, 'test_source1.tsv')
     s2_path = os.path.join(test_dir, 'test_source2.tsv')
@@ -123,7 +130,9 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
         log_n = math.log(max(len(target_ids), 1))
         df = collections.Counter(t for v in target_pre for t in set(v[1].split()))
         idf = collections.defaultdict(lambda: log_n, {t: log_n - math.log(1 + c) for t, c in df.items()})
-        del df
+        name_count = collections.Counter(v[1].replace(' ', '') for v in target_pre)
+        name_freq = [name_count[v[1].replace(' ', '')] for v in target_pre]
+        del df, name_count
         t_index = time.time()
         print(f'  Inverted index built with {len(index):,} active keys (pruned {len(pruned):,} keys); index {t_index - c_t0:.1f}s.')
 
@@ -136,26 +145,32 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
         S = [v.transform([x[j] for x in s1_pre]) for v, j in zip(vecs, (1, 4, 2))]
         t_views = time.time()
 
-        ps, pt, pc, pv = array('i'), array('i'), array('h'), array('f')
-        for i, (eid, rname, raddr) in enumerate(s1_list):
-            pool = rank_candidates(get_blocking_keys(rname, raddr, country, query=True), index, len(target_ids), POOL_K)
-            ps.extend([i] * len(pool))
-            for arr, col in zip((pt, pc, pv), zip(*pool)):
-                arr.extend(col)
-        ps, pt, pc, pv = (np.frombuffer(a, a.typecode) for a in (ps, pt, pc, pv))
-        t_pass1 = time.time()
-
-        cos_n, cos_s, cos_a = (np.zeros(len(ps), np.float32) for _ in range(3))
-        rrf_rank = np.zeros(len(ps), np.int16)
+        parts, n_pooled, t_pool = [], 0, 0.0
         for b0 in range(0, len(s1_list), batch_size):
-            lo, hi = np.searchsorted(ps, [b0, b0 + batch_size])
-            cos_n[lo:hi], cos_s[lo:hi], cos_a[lo:hi], rrf_rank[lo:hi] = rerank(ps[lo:hi], pt[lo:hi], pv[lo:hi], S, T)
-        rev_rank = reverse_add(ps, pt, cos_n, cos_s, cos_a, rrf_rank)
+            t0 = time.time()
+            ps, pt, pc, pv = array('i'), array('i'), array('h'), array('f')
+            for i in range(b0, min(b0 + batch_size, len(s1_list))):
+                eid, rname, raddr = s1_list[i]
+                pool = rank_candidates(get_blocking_keys(rname, raddr, country, query=True), index, len(target_ids), POOL_K)
+                ps.extend([i] * len(pool))
+                for arr, col in zip((pt, pc, pv), zip(*pool)):
+                    arr.extend(col)
+            ps, pt, pc, pv = (np.frombuffer(a, a.typecode) for a in (ps, pt, pc, pv))
+            t_pool += time.time() - t0
+            cn, cs, ca, sim, rr = rerank(ps, pt, pv, S, T, [rrf_weights])
+            keep = (rr[0] < TOP_K) | (sim >= min_rev_sim)
+            parts.append([a[keep] for a in (ps, pt, pc, pv, cn, cs, ca, sim, rr[0])])
+            n_pooled += len(ps)
+        del index, vecs, T, S
+        ps, pt, pc, pv, cos_n, cos_s, cos_a, sim, rrf_rank = (np.concatenate(c) for c in zip(*parts))
+        del parts
+        t_rerank = time.time()
+        rev_rank = reverse_add(ps, pt, sim, rrf_rank, min_rev_sim)
         final = np.flatnonzero((rrf_rank < TOP_K) | (rev_rank >= 0))
         final = final[np.lexsort((np.where(rev_rank[final] >= 0, TOP_K + rev_rank[final], rrf_rank[final]), ps[final]))]
         bounds = np.searchsorted(ps[final], np.arange(len(s1_list) + 1))
-        t_rerank = time.time()
-        print(f'  {len(ps):,} pooled pairs, {len(final):,} final pairs ({int((rev_rank >= 0).sum()):,} reverse additions); views {t_views - t_index:.1f}s, pass 1 {t_pass1 - t_views:.1f}s, rerank+reverse {t_rerank - t_pass1:.1f}s.')
+        t_rev = time.time()
+        print(f'  {n_pooled:,} pooled pairs, {len(ps):,} stored, {len(final):,} final pairs ({int((rev_rank >= 0).sum()):,} reverse additions); views {t_views - t_index:.1f}s, pass 1 {t_pool:.1f}s, rerank {t_rerank - t_views - t_pool:.1f}s, reverse {t_rev - t_rerank:.1f}s.')
 
         print(f'  Scoring candidates for {len(s1_list):,} S1 records in batches of {batch_size}...')
         c_scores_dict = collections.defaultdict(list)
@@ -169,32 +184,37 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
             for i in range(b_start, b_end):
                 eid = s1_list[i][0]
                 f = final[bounds[i]:bounds[i + 1]]
-                pairs = list(zip(*(a[f].tolist() for a in (pt, pc, cos_n, cos_s, cos_a, rrf_rank, rev_rank))))
+                pairs = list(zip(*(a[f].tolist() for a in (pt, pc, pv, cos_n, cos_s, cos_a, rrf_rank, rev_rank))))
                 cand_ids = [target_ids[t] for t, *_ in pairs]
                 all_candidate_results[eid] = cand_ids
                 if pairs:
-                    rows = add_context([extract_features_for_pair(s1_pre[i], target_pre[t], target_ids[t], c, idf) + [n, k, a, float(r), float(v >= 0)] for t, c, n, k, a, r, v in pairs])
+                    rows = add_context([extract_features_for_pair(s1_pre[i], target_pre[t], target_ids[t], c, idf, [n, k, a, float(r), float(v >= 0), b], name_freq[t]) for t, c, b, n, k, a, r, v in pairs])
                     batch_pairs.extend((eid, tid, feats) for tid, feats in zip(cand_ids, rows))
                 else:
                     c_scores_dict[eid] = []
 
             if batch_pairs:
                 X_batch = np.array([p[2] for p in batch_pairs], dtype=np.float32)
-                probas = model.predict_proba(X_batch)
+                probas = calibrator.predict(model.predict_proba(X_batch))
                 for (eid, tid, _), p in zip(batch_pairs, probas):
                     c_scores_dict[eid].append((tid, float(p)))
 
             if (b_idx + 1) % 10 == 0 or (b_idx + 1) == n_batches:
                 print(f'    Processed batch {b_idx + 1}/{n_batches} ({b_end:,}/{len(s1_list):,} records)...')
 
-        print('  Applying gate/addon decision rule and 1-to-1 target consistency...')
-        c_matches = apply_gate_addon(c_scores_dict, gate, addon)
+        print(f'  Applying {rule} decision rule and 1-to-1 target consistency...')
+        if rule == 'per_source':
+            c_matches = apply_threshold_and_deduplication(c_scores_dict, rule_params['s2'], rule_params['s3'])
+        elif rule == 'gate_addon':
+            c_matches = apply_gate_addon(c_scores_dict, rule_params['gate'], rule_params['addon'])
+        else:
+            c_matches = expected_f05_select(c_scores_dict, rule_params['floor'])
         for eid, mids in c_matches.items():
             all_matched_results[eid] = mids
 
         peak_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2 ** 30 if sys.platform == 'darwin' else 2 ** 20)
-        print(f'  Country {country} completed in {time.time()-c_t0:.1f}s (pass 2 features+predict {time.time()-t_rerank:.1f}s), peak RSS {peak_gb:.2f} GB.')
-        del target_pre, index, idf, pruned, s1_pre, vecs, T, S, ps, pt, pc, pv, cos_n, cos_s, cos_a, rrf_rank, rev_rank, final, c_scores_dict, c_matches
+        print(f'  Country {country} completed in {time.time()-c_t0:.1f}s (pass 2 features+predict {time.time()-t_rev:.1f}s), peak RSS {peak_gb:.2f} GB.')
+        del target_pre, idf, name_freq, pruned, s1_pre, ps, pt, pc, pv, cos_n, cos_s, cos_a, sim, rrf_rank, rev_rank, final, c_scores_dict, c_matches
         gc.collect()
 
     print('\n[4/5] Writing output files in exact test Source 1 order...')
@@ -245,8 +265,8 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
         'Model Configuration': {
             'Selected Model': 'LightGBM Gradient Boosted Decision Trees',
             'Tree Parameters': f"n_estimators={params['n_estimators']}, best_iteration_={model.model.best_iteration_}, learning_rate={params['learning_rate']}, num_leaves={params['num_leaves']}",
-            'Gate Threshold': f'{gate:.2f}',
-            'Addon Threshold': f'{addon:.2f}',
+            'Decision Rule': f'{rule} {rule_params} on isotonic-calibrated probabilities',
+            'Retrieval': f'POOL_K={POOL_K}, TOP_K={TOP_K}, RRF weights={rrf_weights}, REV_MAX={REV_MAX}, MIN_REV_SIM={min_rev_sim:.2f}',
             'Global Consistency': 'Source-aware 1-to-1 target assignment (Greedy Highest-Probability)',
             'Feature Set Size': len(FEATURE_NAMES)
         },

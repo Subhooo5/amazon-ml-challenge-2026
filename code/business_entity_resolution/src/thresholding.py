@@ -1,3 +1,4 @@
+import math
 import numpy as np
 from evaluation import evaluate_predictions
 
@@ -97,3 +98,19 @@ def optimize_gate_addon(ground_truth_dict, candidate_scores_dict):
                 best_f05 = metrics['macro_f05']
                 best_gate, best_addon, best_metrics = float(gate), float(addon), metrics
     return best_gate, best_addon, best_metrics
+
+
+def expected_f05_select(scores_dict, floor):
+    kept = {}
+    for s1_id, scores in scores_dict.items():
+        ranked = sorted(scores, key=lambda x: (-x[1], x[0]))
+        total = sum(p for _, p in ranked)
+        best_e, k, acc = math.prod(1.0 - p for _, p in ranked), 0, 0.0
+        for j, (_, p) in enumerate(ranked):
+            if p < floor:
+                break
+            acc += p
+            if 1.25 * acc / (j + 1 + 0.25 * total) > best_e:
+                best_e, k = 1.25 * acc / (j + 1 + 0.25 * total), j + 1
+        kept[s1_id] = ranked[:k]
+    return apply_threshold_and_deduplication(kept, 0.0, 0.0)
