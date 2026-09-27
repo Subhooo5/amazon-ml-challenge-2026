@@ -13,7 +13,7 @@ from array import array
 import normalization as norm
 from features import extract_features_for_pair, add_context, FEATURE_NAMES
 from model import EntityMatcherModel
-from blocking import get_blocking_keys, prune_index, rank_candidates, build_views, rerank, reverse_add, TOP_K, NAME_K, POOL_K, REV_MAX
+from blocking import get_blocking_keys, prune_index, rank_candidates, build_views, rerank, reverse_add, TOP_K, NAME_K, POOL_K, REV_MAX, SINGLE_CAP, COMBO_CAP, VIEWS
 from thresholding import apply_threshold_and_deduplication, apply_gate_addon, expected_f05_select
 from output import write_submission_tsv, write_final_report
 
@@ -34,18 +34,19 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
 
     if meta.get('feature_names') != FEATURE_NAMES or model.model.n_features_in_ != len(FEATURE_NAMES):
         sys.exit(f'Model/feature mismatch: model has {model.model.n_features_in_} features, metadata lists {len(meta.get("feature_names") or [])}, code expects {len(FEATURE_NAMES)}. Retrain with train.py.')
-    if [meta.get(k) for k in ('top_k', 'name_k', 'pool_k', 'rev_max')] != [top_k, NAME_K, POOL_K, REV_MAX]:
-        sys.exit(f'Blocking mismatch: model trained with top_k={meta.get("top_k")}, name_k={meta.get("name_k")}, pool_k={meta.get("pool_k")}, rev_max={meta.get("rev_max")}; inference uses top_k={top_k}, name_k={NAME_K}, pool_k={POOL_K}, rev_max={REV_MAX}. Retrain with train.py.')
+    blocking_keys = ('top_k', 'name_k', 'pool_k', 'rev_max', 'single_cap', 'combo_cap', 'views')
+    if [meta.get(k) for k in blocking_keys] != [top_k, NAME_K, POOL_K, REV_MAX, SINGLE_CAP, COMBO_CAP, VIEWS]:
+        sys.exit(f'Blocking mismatch: model trained with {[meta.get(k) for k in blocking_keys]}; inference uses {[top_k, NAME_K, POOL_K, REV_MAX, SINGLE_CAP, COMBO_CAP, VIEWS]} for {list(blocking_keys)}. Retrain with train.py.')
     rule = meta.get('decision_rule')
     rule_params = meta.get('decision_params') or {}
     rrf_weights = meta.get('rrf_weights')
     min_rev_sim = meta.get('min_rev_sim')
     calibrator_path = meta.get('calibrator_path') or ''
-    if {'per_source': {'s2', 's3'}, 'gate_addon': {'gate', 'addon'}, 'expected_f05': {'floor'}}.get(rule) != set(rule_params) or rrf_weights is None or len(rrf_weights) != 4 or min_rev_sim is None or not os.path.isfile(calibrator_path):
+    if {'per_source': {'s2', 's3'}, 'gate_addon': {'gate', 'addon'}, 'expected_f05': {'floor'}}.get(rule) != set(rule_params) or not isinstance(rrf_weights, dict) or '*' not in rrf_weights or any(len(w) != len(VIEWS) + 1 for w in rrf_weights.values()) or not isinstance(min_rev_sim, dict) or '*' not in min_rev_sim or not os.path.isfile(calibrator_path):
         sys.exit(f'Metadata mismatch: decision_rule={rule} {rule_params}, rrf_weights={rrf_weights}, min_rev_sim={min_rev_sim}, calibrator_path={calibrator_path!r}. Retrain with train.py.')
     calibrator = joblib.load(calibrator_path)
     params = model.model.get_params()
-    print(f'Using RRF weights {rrf_weights}, MIN_REV_SIM {min_rev_sim:.2f}, REV_MAX {REV_MAX}, decision rule {rule} {rule_params} on calibrated probabilities')
+    print(f'Using RRF weights {rrf_weights}, MIN_REV_SIM {min_rev_sim}, TOP_K {TOP_K}, REV_MAX {REV_MAX}, decision rule {rule} {rule_params} on calibrated probabilities')
 
     s1_path = os.path.join(test_dir, 'test_source1.tsv')
     s2_path = os.path.join(test_dir, 'test_source2.tsv')
@@ -141,11 +142,13 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
             cn, core_n, _, skel = norm.normalize_name(rname)
             ca, nums, _ = norm.normalize_address(raddr, country)
             s1_pre.append((cn, core_n, ca, nums, skel))
-        vecs, T = build_views([v[1] for v in target_pre], [v[4] for v in target_pre], [v[2] for v in target_pre])
-        S = [v.transform([x[j] for x in s1_pre]) for v, j in zip(vecs, (1, 4, 2))]
+        vecs, T = build_views([v[1] for v in target_pre], [v[4] for v in target_pre], [v[2] for v in target_pre], [v[1].replace(' ', '') for v in target_pre])
+        S = [v.transform(x) for v, x in zip(vecs, ([x[1] for x in s1_pre], [x[4] for x in s1_pre], [x[2] for x in s1_pre], [x[1].replace(' ', '') for x in s1_pre]))]
+        c_weights = rrf_weights.get(country, rrf_weights['*'])
+        c_min_sim = min_rev_sim.get(country, min_rev_sim['*'])
         t_views = time.time()
 
-        parts, n_pooled, t_pool = [], 0, 0.0
+        store, n_pooled, t_pool = [array(tc) for tc in 'iihffffffh'], 0, 0.0
         for b0 in range(0, len(s1_list), batch_size):
             t0 = time.time()
             ps, pt, pc, pv = array('i'), array('i'), array('h'), array('f')
@@ -157,15 +160,15 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
                     arr.extend(col)
             ps, pt, pc, pv = (np.frombuffer(a, a.typecode) for a in (ps, pt, pc, pv))
             t_pool += time.time() - t0
-            cn, cs, ca, sim, rr = rerank(ps, pt, pv, S, T, [rrf_weights])
-            keep = (rr[0] < TOP_K) | (sim >= min_rev_sim)
-            parts.append([a[keep] for a in (ps, pt, pc, pv, cn, cs, ca, sim, rr[0])])
+            cn, cs, ca, cc, sim, rr = rerank(ps, pt, pv, S, T, [c_weights])
+            keep = (rr[0] < TOP_K) | (sim >= c_min_sim)
+            for col, x in zip(store, (ps, pt, pc, pv, cn, cs, ca, cc, sim, rr[0])):
+                col.frombytes(x[keep].astype(col.typecode).tobytes())
             n_pooled += len(ps)
         del index, vecs, T, S
-        ps, pt, pc, pv, cos_n, cos_s, cos_a, sim, rrf_rank = (np.concatenate(c) for c in zip(*parts))
-        del parts
+        ps, pt, pc, pv, cos_n, cos_s, cos_a, cos_c, sim, rrf_rank = (np.frombuffer(c, c.typecode) for c in store)
         t_rerank = time.time()
-        rev_rank = reverse_add(ps, pt, sim, rrf_rank, min_rev_sim)
+        rev_rank = reverse_add(ps, pt, sim, rrf_rank, c_min_sim)
         final = np.flatnonzero((rrf_rank < TOP_K) | (rev_rank >= 0))
         final = final[np.lexsort((np.where(rev_rank[final] >= 0, TOP_K + rev_rank[final], rrf_rank[final]), ps[final]))]
         bounds = np.searchsorted(ps[final], np.arange(len(s1_list) + 1))
@@ -184,11 +187,11 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
             for i in range(b_start, b_end):
                 eid = s1_list[i][0]
                 f = final[bounds[i]:bounds[i + 1]]
-                pairs = list(zip(*(a[f].tolist() for a in (pt, pc, pv, cos_n, cos_s, cos_a, rrf_rank, rev_rank))))
+                pairs = list(zip(*(a[f].tolist() for a in (pt, pc, pv, cos_n, cos_s, cos_a, cos_c, rrf_rank, rev_rank))))
                 cand_ids = [target_ids[t] for t, *_ in pairs]
                 all_candidate_results[eid] = cand_ids
                 if pairs:
-                    rows = add_context([extract_features_for_pair(s1_pre[i], target_pre[t], target_ids[t], c, idf, [n, k, a, float(r), float(v >= 0), b], name_freq[t]) for t, c, b, n, k, a, r, v in pairs])
+                    rows = add_context([extract_features_for_pair(s1_pre[i], target_pre[t], target_ids[t], c, idf, [n, k, a, cp, float(r), float(v >= 0), b], name_freq[t]) for t, c, b, n, k, a, cp, r, v in pairs])
                     batch_pairs.extend((eid, tid, feats) for tid, feats in zip(cand_ids, rows))
                 else:
                     c_scores_dict[eid] = []
@@ -214,7 +217,7 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
 
         peak_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2 ** 30 if sys.platform == 'darwin' else 2 ** 20)
         print(f'  Country {country} completed in {time.time()-c_t0:.1f}s (pass 2 features+predict {time.time()-t_rev:.1f}s), peak RSS {peak_gb:.2f} GB.')
-        del target_pre, idf, name_freq, pruned, s1_pre, ps, pt, pc, pv, cos_n, cos_s, cos_a, sim, rrf_rank, rev_rank, final, c_scores_dict, c_matches
+        del target_pre, idf, name_freq, pruned, s1_pre, store, ps, pt, pc, pv, cos_n, cos_s, cos_a, cos_c, sim, rrf_rank, rev_rank, final, c_scores_dict, c_matches
         gc.collect()
 
     print('\n[4/5] Writing output files in exact test Source 1 order...')
@@ -266,7 +269,7 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
             'Selected Model': 'LightGBM Gradient Boosted Decision Trees',
             'Tree Parameters': f"n_estimators={params['n_estimators']}, best_iteration_={model.model.best_iteration_}, learning_rate={params['learning_rate']}, num_leaves={params['num_leaves']}",
             'Decision Rule': f'{rule} {rule_params} on isotonic-calibrated probabilities',
-            'Retrieval': f'POOL_K={POOL_K}, TOP_K={TOP_K}, RRF weights={rrf_weights}, REV_MAX={REV_MAX}, MIN_REV_SIM={min_rev_sim:.2f}',
+            'Retrieval': f'POOL_K={POOL_K}, TOP_K={TOP_K}, views={VIEWS}, caps={SINGLE_CAP}/{COMBO_CAP}, RRF weights={rrf_weights}, REV_MAX={REV_MAX}, MIN_REV_SIM={min_rev_sim}',
             'Global Consistency': 'Source-aware 1-to-1 target assignment (Greedy Highest-Probability)',
             'Feature Set Size': len(FEATURE_NAMES)
         },

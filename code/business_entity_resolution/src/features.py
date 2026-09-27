@@ -48,6 +48,7 @@ FEATURE_NAMES = [
     'cos_name',
     'cos_skel',
     'cos_addr',
+    'cos_compact',
     'rrf_rank',
     'is_reverse',
     'blk_score',

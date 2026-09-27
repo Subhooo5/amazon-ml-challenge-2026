@@ -5,13 +5,15 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 import normalization as norm
 
-TOP_K = 25
+TOP_K = 30
 NAME_K = 8
 POOL_K = 200
 REV_MAX = 5
+REV_FLOOR = 0.5
 RRF_C = 60
-SINGLE_CAP = 500
-COMBO_CAP = 2000
+SINGLE_CAP = 1000
+COMBO_CAP = 4000
+VIEWS = ['name', 'skel', 'addr', 'compact']
 NAME_KEYS = {'compact_n', 'compact_sort_n', 'core_n', 'n2', 'sort_n', 'n1', 'n_tok', 'sk', 'compact_strict', 'skn'}
 
 COMMON_ADDR_WORDS = {
@@ -114,28 +116,29 @@ def rank_candidates(keys, index, n_targets, top_k=TOP_K, name_k=NAME_K):
     return [(tid, count[tid], score[tid]) for tid in sorted(picked, key=lambda t: (-score[t], t))]
 
 
-def build_views(names, skels, addrs):
+def build_views(names, skels, addrs, compacts):
     vecs = [
         TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 3), dtype=np.float32, sublinear_tf=True, min_df=2),
         TfidfVectorizer(analyzer='char_wb', ngram_range=(2, 3), dtype=np.float32, sublinear_tf=True, min_df=2),
-        TfidfVectorizer(token_pattern=r'(?u)\b\w+\b', dtype=np.float32, sublinear_tf=True, min_df=2)
+        TfidfVectorizer(token_pattern=r'(?u)\b\w+\b', dtype=np.float32, sublinear_tf=True, min_df=2),
+        TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 4), dtype=np.float32, sublinear_tf=True, min_df=2)
     ]
-    return vecs, [v.fit_transform(x).tocsr() for v, x in zip(vecs, (names, skels, addrs))]
+    return vecs, [v.fit_transform(x).tocsr() for v, x in zip(vecs, (names, skels, addrs, compacts))]
 
 
-def rerank(s_idx, t_idx, blk_score, S, T, weights=((1, 1, 1, 1),)):
+def rerank(s_idx, t_idx, blk_score, S, T, weights=((1, 1, 1, 1, 1),)):
     cos = [np.asarray(Sv[s_idx].multiply(Tv[t_idx]).sum(axis=1), dtype=np.float32).ravel() for Sv, Tv in zip(S, T)]
     rrf_rank = np.zeros((len(weights), len(s_idx)), np.int16)
     if len(s_idx):
         pos = np.arange(len(s_idx))
         ss = np.sort(s_idx)
         within = pos - np.maximum.accumulate(np.where(np.r_[True, ss[1:] != ss[:-1]], pos, 0))
-        inv = np.empty((4, len(s_idx)))
+        inv = np.empty((len(cos) + 1, len(s_idx)))
         for j, v in enumerate([blk_score] + cos):
             inv[j, np.lexsort((t_idx, -blk_score, -v, s_idx))] = 1.0 / (RRF_C + 1 + within)
         for w, r in zip(weights, rrf_rank):
             r[np.lexsort((t_idx, -(np.asarray(w, dtype=float) @ inv), s_idx))] = within
-    return cos[0], cos[1], cos[2], np.maximum(cos[0], cos[1]) + cos[2], rrf_rank
+    return cos[0], cos[1], cos[2], cos[3], np.maximum(cos[0], cos[1]) + cos[2], rrf_rank
 
 
 def reverse_add(s_idx, t_idx, sim, rrf_rank, min_sim=0.0):
