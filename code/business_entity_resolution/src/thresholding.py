@@ -78,3 +78,22 @@ def apply_threshold_and_deduplication(candidate_scores_dict, s2_threshold=0.5, s
             result[s1_id].add(tid)
 
     return result
+
+
+def apply_gate_addon(scores_dict, gate, addon):
+    kept = {}
+    for s1_id, scores in scores_dict.items():
+        ranked = sorted(scores, key=lambda x: (-x[1], x[0]))
+        kept[s1_id] = [(tid, p) for i, (tid, p) in enumerate(ranked) if ranked[0][1] >= gate and (i == 0 or p >= addon)]
+    return apply_threshold_and_deduplication(kept, 0.0, 0.0)
+
+
+def optimize_gate_addon(ground_truth_dict, candidate_scores_dict):
+    best_gate, best_addon, best_metrics, best_f05 = 0.5, 0.5, None, -1.0
+    for gate in np.round(np.arange(0.30, 0.901, 0.02), 2):
+        for addon in np.round(np.arange(0.40, 0.951, 0.02), 2):
+            metrics = evaluate_predictions(ground_truth_dict, apply_gate_addon(candidate_scores_dict, gate, addon))
+            if metrics['macro_f05'] > best_f05:
+                best_f05 = metrics['macro_f05']
+                best_gate, best_addon, best_metrics = float(gate), float(addon), metrics
+    return best_gate, best_addon, best_metrics

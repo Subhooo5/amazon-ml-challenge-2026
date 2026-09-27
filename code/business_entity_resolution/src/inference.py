@@ -3,14 +3,15 @@ import sys
 import time
 import json
 import gc
+import math
 import collections
 import numpy as np
 
 import normalization as norm
-from features import extract_features_for_pair, FEATURE_NAMES
+from features import extract_features_for_pair, add_context, FEATURE_NAMES
 from model import EntityMatcherModel
 from blocking import get_blocking_keys, prune_index, rank_candidates
-from thresholding import apply_threshold_and_deduplication
+from thresholding import apply_gate_addon
 from output import write_submission_tsv, write_final_report
 
 
@@ -28,9 +29,12 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
     with open(meta_path, 'r', encoding='utf-8') as f:
         meta = json.load(f)
 
-    s2_threshold = meta.get('optimal_s2_threshold', 0.75)
-    s3_threshold = meta.get('optimal_s3_threshold', 0.85)
-    print(f'Using decision thresholds: S2 = {s2_threshold:.2f}, S3 = {s3_threshold:.2f}')
+    if meta.get('feature_names') != FEATURE_NAMES or model.model.n_features_in_ != len(FEATURE_NAMES):
+        sys.exit(f'Model/feature mismatch: model has {model.model.n_features_in_} features, metadata lists {len(meta.get("feature_names") or [])}, code expects {len(FEATURE_NAMES)}. Retrain with train.py.')
+    gate = meta['gate_threshold']
+    addon = meta['addon_threshold']
+    params = model.model.get_params()
+    print(f'Using decision rule: gate = {gate:.2f}, addon = {addon:.2f}')
 
     s1_path = os.path.join(test_dir, 'test_source1.tsv')
     s2_path = os.path.join(test_dir, 'test_source2.tsv')
@@ -98,14 +102,18 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
         index = collections.defaultdict(list)
 
         for tid, (rname, raddr, rcountry) in targets.items():
-            cn, core_n, _ = norm.normalize_name(rname)
-            ca, nums, _ = norm.normalize_address(raddr)
-            target_preprocessed[tid] = (cn, core_n, ca, nums)
+            cn, core_n, _, skel = norm.normalize_name(rname)
+            ca, nums, _ = norm.normalize_address(raddr, rcountry)
+            target_preprocessed[tid] = (cn, core_n, ca, nums, skel)
             tkeys = get_blocking_keys(rname, raddr, rcountry)
             for k in tkeys:
                 index[k].append(tid)
 
         pruned = prune_index(index)
+        log_n = math.log(max(len(targets), 1))
+        df = collections.Counter(t for v in target_preprocessed.values() for t in set(v[1].split()))
+        idf = collections.defaultdict(lambda: log_n, {t: log_n - math.log(1 + c) for t, c in df.items()})
+        del df
 
         print(f'  Inverted index built with {len(index):,} active keys (pruned {pruned:,} keys).')
 
@@ -128,14 +136,12 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
                     cand_ids = [tid for tid, _ in cands]
                     all_candidate_results[eid] = cand_ids
 
-                    cn, core_n, _ = norm.normalize_name(rname)
-                    ca, nums, _ = norm.normalize_address(raddr)
-                    s1_tup = (cn, core_n, ca, nums)
+                    cn, core_n, _, skel = norm.normalize_name(rname)
+                    ca, nums, _ = norm.normalize_address(raddr, country)
+                    s1_tup = (cn, core_n, ca, nums, skel)
 
-                    for tid, sh in cands:
-                        t_tup = target_preprocessed[tid]
-                        feats = extract_features_for_pair(s1_tup, t_tup, tid, sh)
-                        batch_pairs.append((eid, tid, feats))
+                    rows = add_context([extract_features_for_pair(s1_tup, target_preprocessed[tid], tid, sh, idf) for tid, sh in cands])
+                    batch_pairs.extend((eid, tid, feats) for (tid, _), feats in zip(cands, rows))
                 else:
                     all_candidate_results[eid] = []
                     c_scores_dict[eid] = []
@@ -149,12 +155,12 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
             if (b_idx + 1) % 10 == 0 or (b_idx + 1) == n_batches:
                 print(f'    Processed batch {b_idx + 1}/{n_batches} ({b_end:,}/{len(s1_list):,} records)...')
 
-        print('  Applying decision thresholds and 1-to-1 target consistency...')
-        c_matches = apply_threshold_and_deduplication(c_scores_dict, s2_threshold, s3_threshold)
+        print('  Applying gate/addon decision rule and 1-to-1 target consistency...')
+        c_matches = apply_gate_addon(c_scores_dict, gate, addon)
         for eid, mids in c_matches.items():
             all_matched_results[eid] = mids
 
-        del targets, target_preprocessed, index, c_scores_dict, c_matches
+        del targets, target_preprocessed, index, idf, c_scores_dict, c_matches
         gc.collect()
         print(f'  Country {country} completed in {time.time()-c_t0:.1f}s.')
 
@@ -205,9 +211,9 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
         },
         'Model Configuration': {
             'Selected Model': 'LightGBM Gradient Boosted Decision Trees',
-            'Tree Parameters': 'n_estimators=350, max_depth=7, num_leaves=63, lr=0.04',
-            'Optimal S2 Threshold': f'{s2_threshold:.2f}',
-            'Optimal S3 Threshold': f'{s3_threshold:.2f}',
+            'Tree Parameters': f"n_estimators={params['n_estimators']}, best_iteration_={model.model.best_iteration_}, learning_rate={params['learning_rate']}, num_leaves={params['num_leaves']}",
+            'Gate Threshold': f'{gate:.2f}',
+            'Addon Threshold': f'{addon:.2f}',
             'Global Consistency': 'Source-aware 1-to-1 target assignment (Greedy Highest-Probability)',
             'Feature Set Size': len(FEATURE_NAMES)
         },

@@ -11,7 +11,7 @@ class EntityMatcherModel:
         self.params = params
         self.model = None
 
-    def fit(self, X, y, sample_weight=None):
+    def fit(self, X, y, eval_set=None):
         if self.model_type == 'lightgbm':
             default_params = {
                 'objective': 'binary',
@@ -30,7 +30,10 @@ class EntityMatcherModel:
             }
             default_params.update(self.params)
             self.model = lgb.LGBMClassifier(**default_params)
-            self.model.fit(X, y, sample_weight=sample_weight)
+            if eval_set is None:
+                self.model.fit(X, y)
+            else:
+                self.model.fit(X, y, eval_set=[eval_set], callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)])
         elif self.model_type == 'hist_gb':
             self.model = HistGradientBoostingClassifier(
                 max_iter=300,
@@ -38,7 +41,7 @@ class EntityMatcherModel:
                 max_leaf_nodes=31,
                 random_state=42
             )
-            self.model.fit(X, y, sample_weight=sample_weight)
+            self.model.fit(X, y)
         else:
             raise ValueError(f'Unknown model type: {self.model_type}')
         return self

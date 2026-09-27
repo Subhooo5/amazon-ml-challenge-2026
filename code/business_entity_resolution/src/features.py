@@ -36,8 +36,32 @@ FEATURE_NAMES = [
     'cross_min',
     'is_source2',
     'is_source3',
-    'shared_keys_count'
+    'shared_keys_count',
+    'skel_token_set',
+    'skel_equal',
+    'legal_equal',
+    'legal_conflict',
+    'desc_conflict',
+    'idf_jaccard',
+    'max_idf_unshared',
+    'blk_rank',
+    'n_cands',
+    'gap_name_set',
+    'gap_name_jw',
+    'gap_addr_set',
+    'gap_cross_prod',
+    'gap_skel_set',
+    'best_name_set',
+    'best_cross_prod'
 ]
+
+LEGAL_CANON = {
+    'incorporated': 'inc', 'corporation': 'corp', 'company': 'co', 'cie': 'co',
+    'limited': 'ltd', 'private': 'pvt'
+}
+
+GAP_COLS = [FEATURE_NAMES.index(n) for n in ('name_token_set', 'name_jw_sim', 'addr_token_set', 'cross_prod', 'skel_token_set')]
+BEST_COLS = [FEATURE_NAMES.index(n) for n in ('name_token_set', 'cross_prod')]
 
 
 def char_ngrams(s, n=3):
@@ -46,9 +70,9 @@ def char_ngrams(s, n=3):
     return {s[i:i+n] for i in range(len(s) - n + 1)}
 
 
-def extract_features_for_pair(s1_tuple, target_tuple, target_id, shared_keys=1):
-    s1_name, s1_core, s1_addr, s1_nums = s1_tuple
-    t_name, t_core, t_addr, t_nums = target_tuple
+def extract_features_for_pair(s1_tuple, target_tuple, target_id, shared_keys=1, idf=None):
+    s1_name, s1_core, s1_addr, s1_nums, s1_skel = s1_tuple
+    t_name, t_core, t_addr, t_nums, t_skel = target_tuple
 
     exact_clean = 1.0 if s1_name == t_name and s1_name else 0.0
     exact_core = 1.0 if s1_core == t_core and s1_core else 0.0
@@ -128,6 +152,25 @@ def extract_features_for_pair(s1_tuple, target_tuple, target_id, shared_keys=1):
     is_s2 = 1.0 if target_id.startswith('S2-') else 0.0
     is_s3 = 1.0 if target_id.startswith('S3-') else 0.0
 
+    skel_set = fuzz.token_set_ratio(s1_skel, t_skel) / 100.0 if s1_skel and t_skel else 0.0
+    skel_equal = 1.0 if s1_skel and s1_skel == t_skel else 0.0
+
+    s1_legal = {LEGAL_CANON.get(t, t) for t in s1_name.split() if t in norm.LEGAL_SUFFIXES and t != 'france'}
+    t_legal = {LEGAL_CANON.get(t, t) for t in t_name.split() if t in norm.LEGAL_SUFFIXES and t != 'france'}
+    legal_equal = 1.0 if s1_legal and s1_legal == t_legal else 0.0
+    legal_conflict = 1.0 if s1_legal and t_legal and not s1_legal & t_legal else 0.0
+    s1_desc = norm.DESCRIPTORS.intersection(s1_name.split())
+    t_desc = norm.DESCRIPTORS.intersection(t_name.split())
+    desc_conflict = 1.0 if s1_desc and t_desc and not s1_desc & t_desc else 0.0
+
+    if idf is not None and s1_toks and t_toks:
+        union_w = sum(idf[t] for t in s1_s | t_s)
+        idf_jaccard = sum(idf[t] for t in s1_s & t_s) / union_w if union_w > 0 else 0.0
+        max_idf_unshared = max((idf[t] for t in s1_s ^ t_s), default=0.0)
+    else:
+        idf_jaccard = 0.0
+        max_idf_unshared = 0.0
+
     return [
         exact_clean,
         exact_core,
@@ -160,5 +203,21 @@ def extract_features_for_pair(s1_tuple, target_tuple, target_id, shared_keys=1):
         cross_min,
         is_s2,
         is_s3,
-        float(shared_keys)
+        float(shared_keys),
+        skel_set,
+        skel_equal,
+        legal_equal,
+        legal_conflict,
+        desc_conflict,
+        idf_jaccard,
+        max_idf_unshared
     ]
+
+
+def add_context(rows):
+    best = {c: max((r[c] for r in rows), default=0.0) for c in GAP_COLS}
+    for rank, r in enumerate(rows):
+        r.extend([float(rank), float(len(rows))])
+        r.extend(r[c] - best[c] for c in GAP_COLS)
+        r.extend(1.0 if r[c] == best[c] else 0.0 for c in BEST_COLS)
+    return rows
