@@ -1,10 +1,15 @@
 import collections
 import heapq
 import math
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
 import normalization as norm
 
 TOP_K = 25
 NAME_K = 8
+POOL_K = 200
+REV_MAX = 10
+RRF_C = 60
 SINGLE_CAP = 500
 COMBO_CAP = 2000
 NAME_KEYS = {'compact_n', 'compact_sort_n', 'core_n', 'n2', 'sort_n', 'n1', 'n_tok', 'sk', 'compact_strict', 'skn'}
@@ -106,4 +111,42 @@ def rank_candidates(keys, index, n_targets, top_k=TOP_K, name_k=NAME_K):
                     name_score[tid] += w
     picked = set(heapq.nsmallest(min(name_k, top_k), name_score, key=lambda t: (-name_score[t], t)))
     picked.update(heapq.nsmallest(top_k - len(picked), (t for t in score if t not in picked), key=lambda t: (-score[t], t)))
-    return [(tid, count[tid]) for tid in sorted(picked, key=lambda t: (-score[t], t))]
+    return [(tid, count[tid], score[tid]) for tid in sorted(picked, key=lambda t: (-score[t], t))]
+
+
+def build_views(names, skels, addrs):
+    vecs = [
+        TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 3), dtype=np.float32, sublinear_tf=True, min_df=2),
+        TfidfVectorizer(analyzer='char_wb', ngram_range=(2, 3), dtype=np.float32, sublinear_tf=True, min_df=2),
+        TfidfVectorizer(token_pattern=r'(?u)\b\w+\b', dtype=np.float32, sublinear_tf=True, min_df=2)
+    ]
+    return vecs, [v.fit_transform(x).tocsr() for v, x in zip(vecs, (names, skels, addrs))]
+
+
+def rerank(s_idx, t_idx, blk_score, S, T):
+    cos = [np.asarray(Sv[s_idx].multiply(Tv[t_idx]).sum(axis=1), dtype=np.float32).ravel() for Sv, Tv in zip(S, T)]
+    rrf_rank = np.zeros(len(s_idx), np.int16)
+    if len(s_idx):
+        pos = np.arange(len(s_idx))
+        ss = np.sort(s_idx)
+        within = pos - np.maximum.accumulate(np.where(np.r_[True, ss[1:] != ss[:-1]], pos, 0))
+        rrf = np.zeros(len(s_idx))
+        for v in [blk_score] + cos:
+            rrf[np.lexsort((t_idx, -blk_score, -v, s_idx))] += 1.0 / (RRF_C + 1 + within)
+        rrf_rank[np.lexsort((t_idx, -rrf, s_idx))] = within
+    return cos[0], cos[1], cos[2], rrf_rank
+
+
+def reverse_add(s_idx, t_idx, cos_name, cos_skel, cos_addr, rrf_rank):
+    rev_rank = np.full(len(s_idx), -1, np.int16)
+    if len(s_idx):
+        sim = np.maximum(cos_name, cos_skel) + cos_addr
+        order = np.lexsort((s_idx, -sim, t_idx))
+        best = order[np.r_[True, t_idx[order][1:] != t_idx[order][:-1]]]
+        add = best[rrf_rank[best] >= TOP_K]
+        add = add[np.lexsort((t_idx[add], -sim[add], s_idx[add]))]
+        pos = np.arange(len(add))
+        grp = np.r_[True, s_idx[add][1:] != s_idx[add][:-1]]
+        r = pos - np.maximum.accumulate(np.where(grp, pos, 0))
+        rev_rank[add[r < REV_MAX]] = r[r < REV_MAX]
+    return rev_rank

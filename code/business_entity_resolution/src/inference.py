@@ -4,13 +4,15 @@ import time
 import json
 import gc
 import math
+import resource
 import collections
 import numpy as np
+from array import array
 
 import normalization as norm
 from features import extract_features_for_pair, add_context, FEATURE_NAMES
 from model import EntityMatcherModel
-from blocking import get_blocking_keys, prune_index, rank_candidates, TOP_K, NAME_K
+from blocking import get_blocking_keys, prune_index, rank_candidates, build_views, rerank, reverse_add, TOP_K, NAME_K, POOL_K, REV_MAX
 from thresholding import apply_gate_addon
 from output import write_submission_tsv, write_final_report
 
@@ -31,8 +33,8 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
 
     if meta.get('feature_names') != FEATURE_NAMES or model.model.n_features_in_ != len(FEATURE_NAMES):
         sys.exit(f'Model/feature mismatch: model has {model.model.n_features_in_} features, metadata lists {len(meta.get("feature_names") or [])}, code expects {len(FEATURE_NAMES)}. Retrain with train.py.')
-    if meta.get('top_k') != top_k or meta.get('name_k') != NAME_K:
-        sys.exit(f'Blocking mismatch: model trained with top_k={meta.get("top_k")}, name_k={meta.get("name_k")}; inference uses top_k={top_k}, name_k={NAME_K}. Retrain with train.py.')
+    if [meta.get(k) for k in ('top_k', 'name_k', 'pool_k', 'rev_max')] != [top_k, NAME_K, POOL_K, REV_MAX]:
+        sys.exit(f'Blocking mismatch: model trained with top_k={meta.get("top_k")}, name_k={meta.get("name_k")}, pool_k={meta.get("pool_k")}, rev_max={meta.get("rev_max")}; inference uses top_k={top_k}, name_k={NAME_K}, pool_k={POOL_K}, rev_max={REV_MAX}. Retrain with train.py.')
     gate = meta['gate_threshold']
     addon = meta['addon_threshold']
     params = model.model.get_params()
@@ -99,54 +101,81 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
 
         print(f'  Loaded {len(targets):,} target records for {country}.')
 
-        print('  Building inverted index for country...')
-        target_preprocessed = {}
-        index = collections.defaultdict(list)
+        if not targets:
+            for eid, _, _ in s1_list:
+                all_candidate_results[eid] = []
+                all_matched_results[eid] = set()
+            continue
 
-        for tid, (rname, raddr, rcountry) in targets.items():
+        print('  Building inverted index for country...')
+        target_ids = sorted(targets)
+        target_pre = []
+        index = collections.defaultdict(list)
+        for i, tid in enumerate(target_ids):
+            rname, raddr, rcountry = targets[tid]
             cn, core_n, _, skel = norm.normalize_name(rname)
             ca, nums, _ = norm.normalize_address(raddr, rcountry)
-            target_preprocessed[tid] = (cn, core_n, ca, nums, skel)
-            tkeys = get_blocking_keys(rname, raddr, rcountry)
-            for k in tkeys:
-                index[k].append(tid)
-
+            target_pre.append((cn, core_n, ca, nums, skel))
+            for k in get_blocking_keys(rname, raddr, rcountry):
+                index[k].append(i)
+        del targets
         pruned = prune_index(index)
-        log_n = math.log(max(len(targets), 1))
-        df = collections.Counter(t for v in target_preprocessed.values() for t in set(v[1].split()))
+        log_n = math.log(max(len(target_ids), 1))
+        df = collections.Counter(t for v in target_pre for t in set(v[1].split()))
         idf = collections.defaultdict(lambda: log_n, {t: log_n - math.log(1 + c) for t, c in df.items()})
         del df
+        t_index = time.time()
+        print(f'  Inverted index built with {len(index):,} active keys (pruned {len(pruned):,} keys); index {t_index - c_t0:.1f}s.')
 
-        t_index = time.time() - c_t0
-        print(f'  Inverted index built with {len(index):,} active keys (pruned {len(pruned):,} keys); target load+normalize+index {t_index:.1f}s.')
+        s1_pre = []
+        for eid, rname, raddr in s1_list:
+            cn, core_n, _, skel = norm.normalize_name(rname)
+            ca, nums, _ = norm.normalize_address(raddr, country)
+            s1_pre.append((cn, core_n, ca, nums, skel))
+        vecs, T = build_views([v[1] for v in target_pre], [v[4] for v in target_pre], [v[2] for v in target_pre])
+        S = [v.transform([x[j] for x in s1_pre]) for v, j in zip(vecs, (1, 4, 2))]
+        t_views = time.time()
+
+        ps, pt, pc, pv = array('i'), array('i'), array('h'), array('f')
+        for i, (eid, rname, raddr) in enumerate(s1_list):
+            pool = rank_candidates(get_blocking_keys(rname, raddr, country, query=True), index, len(target_ids), POOL_K)
+            ps.extend([i] * len(pool))
+            for arr, col in zip((pt, pc, pv), zip(*pool)):
+                arr.extend(col)
+        ps, pt, pc, pv = (np.frombuffer(a, a.typecode) for a in (ps, pt, pc, pv))
+        t_pass1 = time.time()
+
+        cos_n, cos_s, cos_a = (np.zeros(len(ps), np.float32) for _ in range(3))
+        rrf_rank = np.zeros(len(ps), np.int16)
+        for b0 in range(0, len(s1_list), batch_size):
+            lo, hi = np.searchsorted(ps, [b0, b0 + batch_size])
+            cos_n[lo:hi], cos_s[lo:hi], cos_a[lo:hi], rrf_rank[lo:hi] = rerank(ps[lo:hi], pt[lo:hi], pv[lo:hi], S, T)
+        rev_rank = reverse_add(ps, pt, cos_n, cos_s, cos_a, rrf_rank)
+        final = np.flatnonzero((rrf_rank < TOP_K) | (rev_rank >= 0))
+        final = final[np.lexsort((np.where(rev_rank[final] >= 0, TOP_K + rev_rank[final], rrf_rank[final]), ps[final]))]
+        bounds = np.searchsorted(ps[final], np.arange(len(s1_list) + 1))
+        t_rerank = time.time()
+        print(f'  {len(ps):,} pooled pairs, {len(final):,} final pairs ({int((rev_rank >= 0).sum()):,} reverse additions); views {t_views - t_index:.1f}s, pass 1 {t_pass1 - t_views:.1f}s, rerank+reverse {t_rerank - t_pass1:.1f}s.')
 
         print(f'  Scoring candidates for {len(s1_list):,} S1 records in batches of {batch_size}...')
-        
         c_scores_dict = collections.defaultdict(list)
         n_batches = (len(s1_list) + batch_size - 1) // batch_size
 
         for b_idx in range(n_batches):
             b_start = b_idx * batch_size
             b_end = min(b_start + batch_size, len(s1_list))
-            batch = s1_list[b_start:b_end]
 
             batch_pairs = []
-            for eid, rname, raddr in batch:
-                skeys = get_blocking_keys(rname, raddr, country, query=True)
-                cands = rank_candidates(skeys, index, len(targets), top_k)
-
-                if cands:
-                    cand_ids = [tid for tid, _ in cands]
-                    all_candidate_results[eid] = cand_ids
-
-                    cn, core_n, _, skel = norm.normalize_name(rname)
-                    ca, nums, _ = norm.normalize_address(raddr, country)
-                    s1_tup = (cn, core_n, ca, nums, skel)
-
-                    rows = add_context([extract_features_for_pair(s1_tup, target_preprocessed[tid], tid, sh, idf) for tid, sh in cands])
-                    batch_pairs.extend((eid, tid, feats) for (tid, _), feats in zip(cands, rows))
+            for i in range(b_start, b_end):
+                eid = s1_list[i][0]
+                f = final[bounds[i]:bounds[i + 1]]
+                pairs = list(zip(*(a[f].tolist() for a in (pt, pc, cos_n, cos_s, cos_a, rrf_rank, rev_rank))))
+                cand_ids = [target_ids[t] for t, *_ in pairs]
+                all_candidate_results[eid] = cand_ids
+                if pairs:
+                    rows = add_context([extract_features_for_pair(s1_pre[i], target_pre[t], target_ids[t], c, idf) + [n, k, a, float(r), float(v >= 0)] for t, c, n, k, a, r, v in pairs])
+                    batch_pairs.extend((eid, tid, feats) for tid, feats in zip(cand_ids, rows))
                 else:
-                    all_candidate_results[eid] = []
                     c_scores_dict[eid] = []
 
             if batch_pairs:
@@ -163,9 +192,10 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
         for eid, mids in c_matches.items():
             all_matched_results[eid] = mids
 
-        del targets, target_preprocessed, index, idf, pruned, c_scores_dict, c_matches
+        peak_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2 ** 30 if sys.platform == 'darwin' else 2 ** 20)
+        print(f'  Country {country} completed in {time.time()-c_t0:.1f}s (pass 2 features+predict {time.time()-t_rerank:.1f}s), peak RSS {peak_gb:.2f} GB.')
+        del target_pre, index, idf, pruned, s1_pre, vecs, T, S, ps, pt, pc, pv, cos_n, cos_s, cos_a, rrf_rank, rev_rank, final, c_scores_dict, c_matches
         gc.collect()
-        print(f'  Country {country} completed in {time.time()-c_t0:.1f}s (S1 query+features+predict {time.time()-c_t0-t_index:.1f}s).')
 
     print('\n[4/5] Writing output files in exact test Source 1 order...')
     matching_path = os.path.join(output_dir, 'matching_results.tsv')

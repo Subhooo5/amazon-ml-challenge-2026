@@ -6,8 +6,10 @@ import json
 import math
 import random
 import argparse
+import resource
 import collections
 import numpy as np
+from array import array
 
 src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), 'code', 'business_entity_resolution', 'src'))
 if src_dir not in sys.path:
@@ -18,7 +20,7 @@ from features import extract_features_for_pair, add_context, FEATURE_NAMES
 from model import EntityMatcherModel
 from evaluation import evaluate_predictions
 from thresholding import optimize_source_specific_thresholds, apply_threshold_and_deduplication, optimize_gate_addon, apply_gate_addon
-from blocking import get_blocking_keys, prune_index, rank_candidates, TOP_K, NAME_K
+from blocking import get_blocking_keys, prune_index, rank_candidates, build_views, rerank, reverse_add, TOP_K, NAME_K, POOL_K, REV_MAX
 
 
 def auto_detect_train_dir():
@@ -113,18 +115,16 @@ def main():
         for sid, mids in gt.items():
             needed_targets[s1_preprocessed[sid][5]].update(mids)
 
-    print('Extracting features per country (all top-K candidates, full per-country target pool)...')
+    print('Extracting features per country (key pool -> TF-IDF RRF rerank -> reverse lookup, full per-country target pool)...')
+    print('Note: reverse lookup in training runs over the sampled S1 only, so its recall gain is optimistic versus test.')
     t_feat_start = time.time()
     X_train = []
     y_train = []
     X_es = []
     y_es = []
     val_pair_list = []
-    val_ranks = []
-    val_ranks60 = []
-    no_name_k_hits = 0
-    name_k12_hits = 0
-    recall_groups = collections.defaultdict(lambda: [0, 0])
+    stage_hits = collections.defaultdict(collections.Counter)
+    rev_stats = collections.Counter()
     miss_cat = collections.Counter()
     missed_examples = []
     missed_empty_addr = 0
@@ -147,49 +147,79 @@ def main():
                         others += 1
                     targets[p[0]] = (p[1] if len(p) > 1 else '', p[2] if len(p) > 2 else '')
 
-        target_preprocessed = {}
+        target_ids = sorted(targets)
+        val_raw = {mid: targets[mid] for sid in val_s1_ids if s1_preprocessed[sid][5] == country for mid in val_gt[sid] if mid in targets}
+        target_pre = []
         index = collections.defaultdict(list)
-        for tid, (rname, raddr) in targets.items():
+        for i, tid in enumerate(target_ids):
+            rname, raddr = targets[tid]
             cn, core_n, _, skel = norm.normalize_name(rname)
             ca, nums, _ = norm.normalize_address(raddr, country)
-            target_preprocessed[tid] = (cn, core_n, ca, nums, skel)
+            target_pre.append((cn, core_n, ca, nums, skel))
             for k in get_blocking_keys(rname, raddr, country):
-                index[k].append(tid)
+                index[k].append(i)
+        del targets
         pruned = prune_index(index)
-        log_n = math.log(max(len(targets), 1))
-        df = collections.Counter(t for v in target_preprocessed.values() for t in set(v[1].split()))
+        val_idx = {tid: i for i, tid in enumerate(target_ids) if tid in val_raw}
+        log_n = math.log(max(len(target_ids), 1))
+        df = collections.Counter(t for v in target_pre for t in set(v[1].split()))
         idf = collections.defaultdict(lambda: log_n, {t: log_n - math.log(1 + c) for t, c in df.items()})
         del df
-        t_index = time.time() - c_t0
+        t_index = time.time()
 
-        for sid in [sid for sid in train_s1_ids if s1_preprocessed[sid][5] == country]:
-            cands = rank_candidates(s1_blocking_keys[sid], index, len(targets), TOP_K)
+        vecs, T = build_views([v[1] for v in target_pre], [v[4] for v in target_pre], [v[2] for v in target_pre])
+        q_ids = [sid for sid in train_s1_ids + val_s1_ids if s1_preprocessed[sid][5] == country]
+        S = [v.transform([s1_preprocessed[sid][j] for sid in q_ids]) for v, j in zip(vecs, (1, 4, 2))]
+        t_views = time.time()
+
+        ps, pt, pc, pv = array('i'), array('i'), array('h'), array('f')
+        for i, sid in enumerate(q_ids):
+            pool = rank_candidates(s1_blocking_keys[sid], index, len(target_ids), POOL_K)
+            ps.extend([i] * len(pool))
+            for arr, col in zip((pt, pc, pv), zip(*pool)):
+                arr.extend(col)
+        ps, pt, pc, pv = (np.frombuffer(a, a.typecode) for a in (ps, pt, pc, pv))
+        t_pass1 = time.time()
+
+        cos_n, cos_s, cos_a = (np.zeros(len(ps), np.float32) for _ in range(3))
+        rrf_rank = np.zeros(len(ps), np.int16)
+        for b0 in range(0, len(q_ids), 5000):
+            lo, hi = np.searchsorted(ps, [b0, b0 + 5000])
+            cos_n[lo:hi], cos_s[lo:hi], cos_a[lo:hi], rrf_rank[lo:hi] = rerank(ps[lo:hi], pt[lo:hi], pv[lo:hi], S, T)
+        rev_rank = reverse_add(ps, pt, cos_n, cos_s, cos_a, rrf_rank)
+        final = np.flatnonzero((rrf_rank < TOP_K) | (rev_rank >= 0))
+        final = final[np.lexsort((np.where(rev_rank[final] >= 0, TOP_K + rev_rank[final], rrf_rank[final]), ps[final]))]
+        bounds = np.searchsorted(ps[final], np.arange(len(q_ids) + 1))
+        pool_off = np.searchsorted(ps, np.arange(len(q_ids) + 1))
+        t_rerank = time.time()
+
+        for i, sid in enumerate(q_ids):
+            f = final[bounds[i]:bounds[i + 1]]
+            pairs = list(zip(*(a[f].tolist() for a in (pt, pc, cos_n, cos_s, cos_a, rrf_rank, rev_rank))))
             s1_tup = s1_preprocessed[sid][:5]
-            rows = add_context([extract_features_for_pair(s1_tup, target_preprocessed[tid], tid, sh, idf) for tid, sh in cands])
-            X_part, y_part = (X_es, y_es) if sid in es_s1_set else (X_train, y_train)
-            X_part.extend(rows)
-            y_part.extend(int(tid in train_gt[sid]) for tid, _ in cands)
-
-        for sid in [sid for sid in val_s1_ids if s1_preprocessed[sid][5] == country]:
+            rows = add_context([extract_features_for_pair(s1_tup, target_pre[t], target_ids[t], c, idf) + [n, k, a, float(r), float(v >= 0)] for t, c, n, k, a, r, v in pairs])
+            cand = [target_ids[t] for t, *_ in pairs]
+            if sid not in val_gt:
+                X_part, y_part = (X_es, y_es) if sid in es_s1_set else (X_train, y_train)
+                X_part.extend(rows)
+                y_part.extend(int(tid in train_gt[sid]) for tid in cand)
+                continue
+            val_pair_list.extend((sid, tid, feats) for tid, feats in zip(cand, rows))
             skeys = s1_blocking_keys[sid]
-            cands = rank_candidates(skeys, index, len(targets), TOP_K)
-            rank_of = {tid: r for r, (tid, _) in enumerate(cands)}
-            rank60 = {tid: r for r, (tid, _) in enumerate(rank_candidates(skeys, index, len(targets), 60))}
-            no_name_k = {tid for tid, _ in rank_candidates(skeys, index, len(targets), TOP_K, 0)}
-            name_k12 = {tid for tid, _ in rank_candidates(skeys, index, len(targets), TOP_K, 12)}
-            s1_tup = s1_preprocessed[sid][:5]
-            rows = add_context([extract_features_for_pair(s1_tup, target_preprocessed[tid], tid, sh, idf) for tid, sh in cands])
-            val_pair_list.extend((sid, tid, feats) for (tid, _), feats in zip(cands, rows))
+            pool_t = pt[pool_off[i]:pool_off[i + 1]].tolist()
+            pos = {t: j for j, t in enumerate(pool_t)}
+            kept = set(pt[pool_off[i]:pool_off[i + 1]][rrf_rank[pool_off[i]:pool_off[i + 1]] < TOP_K].tolist())
+            old = {t for t, _, _ in rank_candidates(skeys, index, len(target_ids), TOP_K)}
+            final_set = set(cand)
+            rev_ids = [tid for tid, (*_, v) in zip(cand, pairs) if v >= 0]
+            rev_stats.update({'s1': 1, 'size': len(cand), 'added': len(rev_ids), 'added_true': sum(tid in val_gt[sid] for tid in rev_ids)})
             for mid in sorted(val_gt[sid]):
-                val_ranks.append(rank_of.get(mid))
-                val_ranks60.append(rank60.get(mid))
-                no_name_k_hits += mid in no_name_k
-                name_k12_hits += mid in name_k12
-                t_name, t_addr = targets.get(mid, ('', ''))
-                for g in [country] + ([] if t_name.isascii() else ['non-ASCII']):
-                    recall_groups[g][0] += mid in rank_of
-                    recall_groups[g][1] += 1
-                if mid not in rank_of:
+                t = val_idx.get(mid)
+                t_name, t_addr = val_raw.get(mid, ('', ''))
+                hits = {'pool@50': pos.get(t, POOL_K) < 50, 'pool@100': pos.get(t, POOL_K) < 100, 'pool@200': t in pos, 'old@25': t in old, 'rrf@25': t in kept, 'final': mid in final_set}
+                for g in ['all', country] + ([] if t_name.isascii() else ['non-ASCII']):
+                    stage_hits[g].update(['n'] + [k for k, h in hits.items() if h])
+                if mid not in final_set:
                     shared = skeys & get_blocking_keys(t_name, t_addr, country)
                     miss_cat['no_shared_key' if not shared else 'only_pruned' if shared <= pruned else 'ranked_out'] += 1
                     missed_empty_addr += not norm.clean_string(t_addr)
@@ -197,8 +227,10 @@ def main():
                     if len(missed_examples) < 20:
                         missed_examples.append(f'{sid} {s1_raw[sid][0]} | {s1_raw[sid][1]}  <->  {mid} {t_name} | {t_addr}')
 
-        print(f'  {country}: {len(targets):,} targets, {len(pruned):,} keys pruned, target load+normalize+index {t_index:.1f}s, S1 query+features {time.time() - c_t0 - t_index:.1f}s')
-        del targets, target_preprocessed, index, idf, pruned
+        peak_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2 ** 30 if sys.platform == 'darwin' else 2 ** 20)
+        print(f'  {country}: {len(target_ids):,} targets, {len(pruned):,} keys pruned, {len(q_ids):,} S1, {len(ps):,} pooled pairs, {len(final):,} final pairs; '
+              f'index {t_index - c_t0:.1f}s, views {t_views - t_index:.1f}s, pass 1 {t_pass1 - t_views:.1f}s, rerank+reverse {t_rerank - t_pass1:.1f}s, pass 2 {time.time() - t_rerank:.1f}s, peak RSS {peak_gb:.2f} GB')
+        del target_pre, index, idf, pruned, vecs, T, S, ps, pt, pc, pv, cos_n, cos_s, cos_a, rrf_rank, rev_rank, final, val_raw, val_idx
         gc.collect()
 
     X_train = np.array(X_train, dtype=np.float32)
@@ -237,8 +269,8 @@ def main():
     for sid in val_s1_ids:
         if sid not in scores_dict:
             scores_dict[sid] = []
-    retrieved_val_true = sum(r is not None for r in val_ranks)
-    total_val_true = len(val_ranks)
+    retrieved_val_true = stage_hits['all']['final']
+    total_val_true = stage_hits['all']['n']
 
     opt_s2, opt_s3, best_metrics = optimize_source_specific_thresholds(val_gt, scores_dict)
     source_metrics = evaluate_predictions(val_gt, apply_threshold_and_deduplication(scores_dict, opt_s2, opt_s3))
@@ -262,12 +294,10 @@ def main():
     print(f"False Negatives   : {metrics['total_fn']}")
     print(f"Predicted Links   : {metrics['total_pred_links']}")
     print(f"Singleton Accuracy: {metrics['singleton_accuracy']:.6f}")
-    for k in (10, 15, 20, 25, 40, 60):
-        print(f"Top-60 Recall@{k:<3}: {sum(r is not None and r < k for r in val_ranks60) / max(total_val_true, 1):.6f}")
-    print(f"name_k=0 Recall@25: {no_name_k_hits / max(total_val_true, 1):.6f}, name_k=12 Recall@25: {name_k12_hits / max(total_val_true, 1):.6f}")
-    for g, (hits, n) in recall_groups.items():
-        print(f"Recall@25 {g:<9}: {hits / n:.6f} ({hits:,}/{n:,})")
-    print(f"Missed at TOP_K   : no_shared_key {miss_cat['no_shared_key']:,}, only_pruned {miss_cat['only_pruned']:,}, ranked_out {miss_cat['ranked_out']:,}")
+    for g, h in stage_hits.items():
+        print(f"Recall {g:<9}: " + ', '.join(f'{k} {h[k] / h["n"]:.6f}' for k in ('pool@50', 'pool@100', 'pool@200', 'old@25', 'rrf@25', 'final')) + f' ({h["n"]:,} links)')
+    print(f"Final list size   : {rev_stats['size'] / max(rev_stats['s1'], 1):.2f} per S1, reverse additions {rev_stats['added'] / max(rev_stats['s1'], 1):.2f} per S1, {rev_stats['added_true'] / max(rev_stats['added'], 1):.6f} of them true")
+    print(f"Missed in final   : no_shared_key {miss_cat['no_shared_key']:,}, only_pruned {miss_cat['only_pruned']:,}, ranked_out {miss_cat['ranked_out']:,}")
     print('=' * 60 + '\n')
     print(f'Missed validation links (first {len(missed_examples)}):')
     for ex in missed_examples:
@@ -298,6 +328,8 @@ def main():
         'singleton_accuracy': float(metrics['singleton_accuracy']),
         'top_k': TOP_K,
         'name_k': NAME_K,
+        'pool_k': POOL_K,
+        'rev_max': REV_MAX,
         'n_train': len(train_s1_ids),
         'n_val': len(val_s1_ids),
         'pool_limit': args.pool_limit,
