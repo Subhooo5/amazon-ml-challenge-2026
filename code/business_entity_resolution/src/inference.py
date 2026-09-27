@@ -42,7 +42,7 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
     rrf_weights = meta.get('rrf_weights')
     min_rev_sim = meta.get('min_rev_sim')
     calibrator_path = meta.get('calibrator_path') or ''
-    if {'per_source': {'s2', 's3'}, 'gate_addon': {'gate', 'addon'}, 'expected_f05': {'floor'}}.get(rule) != set(rule_params) or not isinstance(rrf_weights, dict) or '*' not in rrf_weights or any(len(w) != len(VIEWS) + 1 for w in rrf_weights.values()) or not isinstance(min_rev_sim, dict) or '*' not in min_rev_sim or not os.path.isfile(calibrator_path):
+    if {'per_source': {'s2', 's3'}, 'gate_addon': {'gate', 'addon', 'margin'}, 'expected_f05': {'floor'}}.get(rule) != set(rule_params) or not isinstance(rrf_weights, dict) or '*' not in rrf_weights or any(len(w) != len(VIEWS) + 1 for w in rrf_weights.values()) or not isinstance(min_rev_sim, dict) or '*' not in min_rev_sim or not os.path.isfile(calibrator_path):
         sys.exit(f'Metadata mismatch: decision_rule={rule} {rule_params}, rrf_weights={rrf_weights}, min_rev_sim={min_rev_sim}, calibrator_path={calibrator_path!r}. Retrain with train.py.')
     calibrator = joblib.load(calibrator_path)
     params = model.model.get_params()
@@ -168,7 +168,7 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
         del index, vecs, T, S
         ps, pt, pc, pv, cos_n, cos_s, cos_a, cos_c, sim, rrf_rank = (np.frombuffer(c, c.typecode) for c in store)
         t_rerank = time.time()
-        rev_rank = reverse_add(ps, pt, sim, rrf_rank, c_min_sim)
+        rev_rank, comp = reverse_add(ps, pt, sim, rrf_rank, c_min_sim)
         final = np.flatnonzero((rrf_rank < TOP_K) | (rev_rank >= 0))
         final = final[np.lexsort((np.where(rev_rank[final] >= 0, TOP_K + rev_rank[final], rrf_rank[final]), ps[final]))]
         bounds = np.searchsorted(ps[final], np.arange(len(s1_list) + 1))
@@ -187,11 +187,11 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
             for i in range(b_start, b_end):
                 eid = s1_list[i][0]
                 f = final[bounds[i]:bounds[i + 1]]
-                pairs = list(zip(*(a[f].tolist() for a in (pt, pc, pv, cos_n, cos_s, cos_a, cos_c, rrf_rank, rev_rank))))
+                pairs = list(zip(*(a[f].tolist() for a in (pt, pc, pv, cos_n, cos_s, cos_a, cos_c, rrf_rank, rev_rank, *comp))))
                 cand_ids = [target_ids[t] for t, *_ in pairs]
                 all_candidate_results[eid] = cand_ids
                 if pairs:
-                    rows = add_context([extract_features_for_pair(s1_pre[i], target_pre[t], target_ids[t], c, idf, [n, k, a, cp, float(r), float(v >= 0), b], name_freq[t]) for t, c, b, n, k, a, cp, r, v in pairs])
+                    rows = add_context([extract_features_for_pair(s1_pre[i], target_pre[t], target_ids[t], c, idf, [n, k, a, cp, float(r), float(v >= 0), b], name_freq[t], cm) for t, c, b, n, k, a, cp, r, v, *cm in pairs])
                     batch_pairs.extend((eid, tid, feats) for tid, feats in zip(cand_ids, rows))
                 else:
                     c_scores_dict[eid] = []
@@ -209,7 +209,7 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
         if rule == 'per_source':
             c_matches = apply_threshold_and_deduplication(c_scores_dict, rule_params['s2'], rule_params['s3'])
         elif rule == 'gate_addon':
-            c_matches = apply_gate_addon(c_scores_dict, rule_params['gate'], rule_params['addon'])
+            c_matches = apply_gate_addon(c_scores_dict, rule_params['gate'], rule_params['addon'], rule_params['margin'])
         else:
             c_matches = expected_f05_select(c_scores_dict, rule_params['floor'])
         for eid, mids in c_matches.items():
@@ -217,7 +217,7 @@ def run_test_inference(test_dir, model_path, meta_path, output_dir, batch_size=5
 
         peak_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (2 ** 30 if sys.platform == 'darwin' else 2 ** 20)
         print(f'  Country {country} completed in {time.time()-c_t0:.1f}s (pass 2 features+predict {time.time()-t_rev:.1f}s), peak RSS {peak_gb:.2f} GB.')
-        del target_pre, idf, name_freq, pruned, s1_pre, store, ps, pt, pc, pv, cos_n, cos_s, cos_a, cos_c, sim, rrf_rank, rev_rank, final, c_scores_dict, c_matches
+        del target_pre, idf, name_freq, pruned, s1_pre, store, ps, pt, pc, pv, cos_n, cos_s, cos_a, cos_c, sim, rrf_rank, rev_rank, comp, final, c_scores_dict, c_matches
         gc.collect()
 
     print('\n[4/5] Writing output files in exact test Source 1 order...')

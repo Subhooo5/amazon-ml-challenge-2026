@@ -58,6 +58,11 @@ FEATURE_NAMES = [
     's1_addr_missing',
     'num_jaccard',
     'name_pool_freq',
+    't_n_s1',
+    't_best_sim',
+    't_second_sim',
+    'is_t_best',
+    't_sim_gap',
     'blk_rank',
     'n_cands',
     'gap_name_set',
@@ -88,7 +93,7 @@ def char_ngrams(s, n=3):
     return {s[i:i+n] for i in range(len(s) - n + 1)}
 
 
-def extract_features_for_pair(s1_tuple, target_tuple, target_id, shared_keys=1, idf=None, retrieval=(), name_freq=0):
+def extract_features_for_pair(s1_tuple, target_tuple, target_id, shared_keys=1, idf=None, retrieval=(), name_freq=0, competition=()):
     s1_name, s1_core, s1_addr, s1_nums, s1_skel = s1_tuple
     t_name, t_core, t_addr, t_nums, t_skel = target_tuple
 
@@ -243,7 +248,7 @@ def extract_features_for_pair(s1_tuple, target_tuple, target_id, shared_keys=1, 
         0.0 if s1_addr else 1.0,
         num_jaccard,
         math.log1p(name_freq)
-    ]
+    ] + list(competition)
 
 
 def add_context(rows):

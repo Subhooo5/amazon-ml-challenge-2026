@@ -143,6 +143,7 @@ def rerank(s_idx, t_idx, blk_score, S, T, weights=((1, 1, 1, 1, 1),)):
 
 def reverse_add(s_idx, t_idx, sim, rrf_rank, min_sim=0.0):
     rev_rank = np.full(len(s_idx), -1, np.int16)
+    comp = np.zeros((5, len(s_idx)), np.float32)
     live = np.flatnonzero((rrf_rank < TOP_K) | (sim >= min_sim))
     if len(live):
         order = live[np.lexsort((s_idx[live], -sim[live], t_idx[live]))]
@@ -153,4 +154,13 @@ def reverse_add(s_idx, t_idx, sim, rrf_rank, min_sim=0.0):
         grp = np.r_[True, s_idx[add][1:] != s_idx[add][:-1]]
         r = pos - np.maximum.accumulate(np.where(grp, pos, 0))
         rev_rank[add[r < REV_MAX]] = r[r < REV_MAX]
-    return rev_rank
+        final = np.flatnonzero((rrf_rank < TOP_K) | (rev_rank >= 0))
+        order = final[np.lexsort((s_idx[final], -sim[final], t_idx[final]))]
+        head = np.r_[True, t_idx[order][1:] != t_idx[order][:-1]]
+        first = np.flatnonzero(head)
+        size = np.diff(np.r_[first, len(order)])
+        g = np.cumsum(head) - 1
+        top = sim[order][first]
+        second = np.where(size > 1, sim[order][np.minimum(first + 1, len(order) - 1)], 0)
+        comp[:, order] = [size[g], top[g], second[g], head, sim[order] - np.where(head, second[g], top[g])]
+    return rev_rank, comp

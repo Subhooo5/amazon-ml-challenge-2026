@@ -81,11 +81,11 @@ def apply_threshold_and_deduplication(candidate_scores_dict, s2_threshold=0.5, s
     return result
 
 
-def apply_gate_addon(scores_dict, gate, addon):
+def apply_gate_addon(scores_dict, gate, addon, margin=1.0):
     kept = {}
     for s1_id, scores in scores_dict.items():
         ranked = sorted(scores, key=lambda x: (-x[1], x[0]))
-        kept[s1_id] = [(tid, p) for i, (tid, p) in enumerate(ranked) if ranked[0][1] >= gate and (i == 0 or p >= addon)]
+        kept[s1_id] = [(tid, p) for i, (tid, p) in enumerate(ranked) if ranked[0][1] >= gate and (i == 0 or (p >= addon and ranked[0][1] - p <= margin))]
     return apply_threshold_and_deduplication(kept, 0.0, 0.0)
 
 
@@ -97,7 +97,19 @@ def optimize_gate_addon(ground_truth_dict, candidate_scores_dict):
             if metrics['macro_f05'] > best_f05:
                 best_f05 = metrics['macro_f05']
                 best_gate, best_addon, best_metrics = float(gate), float(addon), metrics
-    return best_gate, best_addon, best_metrics
+    best_margin = 1.0
+    for margin in (0.05, 0.10, 0.20, 0.30):
+        metrics = evaluate_predictions(ground_truth_dict, apply_gate_addon(candidate_scores_dict, best_gate, best_addon, margin))
+        if metrics['macro_f05'] > best_f05:
+            best_f05, best_margin, best_metrics = metrics['macro_f05'], margin, metrics
+    g0, a0 = best_gate, best_addon
+    for gate in np.round(g0 + np.arange(-0.04, 0.041, 0.02), 2):
+        for addon in np.round(a0 + np.arange(-0.04, 0.041, 0.02), 2):
+            metrics = evaluate_predictions(ground_truth_dict, apply_gate_addon(candidate_scores_dict, gate, addon, best_margin))
+            if metrics['macro_f05'] > best_f05:
+                best_f05 = metrics['macro_f05']
+                best_gate, best_addon, best_metrics = float(gate), float(addon), metrics
+    return best_gate, best_addon, best_margin, best_metrics
 
 
 def expected_f05_select(scores_dict, floor):

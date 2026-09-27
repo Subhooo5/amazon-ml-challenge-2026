@@ -221,14 +221,14 @@ def main():
         t_pass = time.time()
 
         ps, pt, pc, pv, cos_n, cos_s, cos_a, cos_c, sim, rrf_rank = (np.frombuffer(c, c.typecode) for c in store)
-        rev0 = reverse_add(ps, pt, sim, rrf_rank, REV_FLOOR)
+        rev0 = reverse_add(ps, pt, sim, rrf_rank, REV_FLOOR)[0]
         cand = np.flatnonzero(rev0 >= 0)
         cand = cand[[all_s1[s][0] in train_gt and target_ids[t] in train_gt[all_s1[s][0]] for s, t in zip(ps[cand].tolist(), pt[cand].tolist())]]
         true_sims = np.sort(sim[cand])[::-1]
         sims_total.append(true_sims)
         cut = float(true_sims[math.ceil(0.95 * len(true_sims)) - 1]) if len(true_sims) else 2.0
         min_rev_sim[country] = max(REV_FLOOR, math.floor(100 * cut) / 100)
-        rev_rank = reverse_add(ps, pt, sim, rrf_rank, min_rev_sim[country])
+        rev_rank, comp = reverse_add(ps, pt, sim, rrf_rank, min_rev_sim[country])
         final = np.flatnonzero((rrf_rank < TOP_K) | (rev_rank >= 0))
         final = final[np.lexsort((np.where(rev_rank[final] >= 0, TOP_K + rev_rank[final], rrf_rank[final]), ps[final]))]
         bounds = np.searchsorted(ps[final], np.arange(len(all_s1) + 1))
@@ -240,10 +240,10 @@ def main():
         for sid in [sid for sid in train_s1_ids + val_s1_ids if s1_preprocessed[sid][5] == country]:
             i = pos_of[sid]
             f = final[bounds[i]:bounds[i + 1]]
-            pairs = list(zip(*(a[f].tolist() for a in (pt, pc, pv, cos_n, cos_s, cos_a, cos_c, rrf_rank, rev_rank))))
+            pairs = list(zip(*(a[f].tolist() for a in (pt, pc, pv, cos_n, cos_s, cos_a, cos_c, rrf_rank, rev_rank, *comp))))
             s1_tup = s1_preprocessed[sid][:5]
             t0 = time.time()
-            rows = add_context([extract_features_for_pair(s1_tup, target_pre[t], target_ids[t], c, idf, [n, k, a, cp, float(r), float(v >= 0), b], name_freq[t]) for t, c, b, n, k, a, cp, r, v in pairs])
+            rows = add_context([extract_features_for_pair(s1_tup, target_pre[t], target_ids[t], c, idf, [n, k, a, cp, float(r), float(v >= 0), b], name_freq[t], cm) for t, c, b, n, k, a, cp, r, v, *cm in pairs])
             t_feat += time.time() - t0
             n_feat += len(rows)
             cand = [target_ids[t] for t, *_ in pairs]
@@ -279,7 +279,7 @@ def main():
               f'weights {rrf_weights[country]} (grid top-30 recall {grid_hits.max() / max(sum(len(train_gt[sid]) for sid in train_s1_ids if s1_preprocessed[sid][5] == country), 1):.6f}), {len(true_sims):,} true reverse additions among training S1')
         print(f'  {country} timings: index {t_index - c_t0:.1f}s, views {t_views - t_index:.1f}s, grid {t_grid - t_views:.1f}s, all-S1 pass 1 {t_pool:.1f}s, rerank {t_pass - t_grid - t_pool:.1f}s, reverse {t_rev - t_pass:.1f}s, '
               f'pass 2 {time.time() - t_rev:.1f}s ({1e6 * t_feat / max(n_feat, 1):.1f} us/pair features), peak RSS {peak_gb:.2f} GB')
-        del target_pre, idf, name_freq, store, ps, pt, pc, pv, cos_n, cos_s, cos_a, cos_c, sim, rrf_rank, rev0, rev_rank, final, val_raw, val_idx, val_pool, val_old, pos_of
+        del target_pre, idf, name_freq, store, ps, pt, pc, pv, cos_n, cos_s, cos_a, cos_c, sim, rrf_rank, rev0, rev_rank, comp, final, val_raw, val_idx, val_pool, val_old, pos_of
         gc.collect()
 
     all_sims = np.sort(np.concatenate(sims_total))[::-1]
@@ -316,8 +316,8 @@ def main():
     print(f'Model trained in {time.time()-t_train_start:.1f}s, best_iteration_ = {final_model.model.best_iteration_}.')
     gain = final_model.model.booster_.feature_importance('gain', iteration=final_model.model.best_iteration_)
     print('Top 20 features by gain: ' + ', '.join(f'{FEATURE_NAMES[i]} {gain[i]:.0f}' for i in np.argsort(-gain, kind='stable')[:20]))
-    new_features = FEATURE_NAMES[FEATURE_NAMES.index('blk_score'):FEATURE_NAMES.index('blk_rank')] + ['blk_score_gap', 'gap_cos_name']
-    print('New feature gains: ' + ', '.join(f'{n} {gain[FEATURE_NAMES.index(n)]:.0f}' for n in new_features))
+    new_features = FEATURE_NAMES[FEATURE_NAMES.index('t_n_s1'):FEATURE_NAMES.index('blk_rank')]
+    print('Competition feature gains: ' + ', '.join(f'{n} {gain[FEATURE_NAMES.index(n)]:.0f}' for n in new_features))
 
     calibrator = IsotonicRegression(out_of_bounds='clip').fit(final_model.predict_proba(X_es), y_es)
     calibrator_path = os.path.join(os.path.dirname(args.model_out) or '.', 'calibrator.joblib')
@@ -337,16 +337,16 @@ def main():
     total_val_true = stage_hits['all']['n']
 
     opt_s2, opt_s3, _ = optimize_source_specific_thresholds(val_gt, scores_dict)
-    gate, addon, _ = optimize_gate_addon(val_gt, scores_dict)
+    gate, addon, margin, _ = optimize_gate_addon(val_gt, scores_dict)
     floor = max((float(f) for f in np.round(np.arange(0.05, 0.601, 0.05), 2)), key=lambda f: evaluate_predictions(val_gt, expected_f05_select(scores_dict, f))['macro_f05'])
     rules = {
         'per_source': {'s2': float(opt_s2), 's3': float(opt_s3)},
-        'gate_addon': {'gate': gate, 'addon': addon},
+        'gate_addon': {'gate': gate, 'addon': addon, 'margin': margin},
         'expected_f05': {'floor': floor}
     }
     rule_metrics = {
         'per_source': evaluate_predictions(val_gt, apply_threshold_and_deduplication(scores_dict, opt_s2, opt_s3)),
-        'gate_addon': evaluate_predictions(val_gt, apply_gate_addon(scores_dict, gate, addon)),
+        'gate_addon': evaluate_predictions(val_gt, apply_gate_addon(scores_dict, gate, addon, margin)),
         'expected_f05': evaluate_predictions(val_gt, expected_f05_select(scores_dict, floor))
     }
     decision_rule = max(rule_metrics, key=lambda r: rule_metrics[r]['macro_f05'])
